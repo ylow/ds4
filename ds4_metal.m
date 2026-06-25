@@ -6656,6 +6656,13 @@ static int ds4_gpu_flash_attn_stage_profile_boundary(
     return *cbp != nil && owned == 0;
 }
 
+/* Metal has no CUDA-graph capture; report unavailable so the decode driver keeps
+ * using the direct command-buffer path. */
+int ds4_gpu_decode_graph_available(void) { return 0; }
+int ds4_gpu_decode_graph_begin(void) { return 0; }
+int ds4_gpu_decode_graph_end(void) { return 0; }
+void ds4_gpu_decode_graph_abort(void) {}
+
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return ds4_gpu_end_commands();

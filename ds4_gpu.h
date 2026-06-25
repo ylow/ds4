@@ -54,6 +54,17 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* CUDA Graph capture for the single-token decode path. _available() is gated by
+ * the DS4_CUDA_GRAPH env var. The decode driver brackets the encode with
+ * _begin()/_end(): _begin starts stream capture, _end replays the captured tape
+ * as a graph (returns 1 on success, 0 to signal the caller to fall back to the
+ * direct begin/encode/end path). _abort() discards an in-progress capture when
+ * the encode itself failed. Non-CUDA backends provide no-op stubs. */
+int ds4_gpu_decode_graph_available(void);
+int ds4_gpu_decode_graph_begin(void);
+int ds4_gpu_decode_graph_end(void);
+void ds4_gpu_decode_graph_abort(void);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);

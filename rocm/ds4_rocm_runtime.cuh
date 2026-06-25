@@ -4601,6 +4601,13 @@ extern "C" int ds4_gpu_end_commands(void) {
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+/* ROCm/HIP graph capture for decode is not implemented here yet; report
+ * unavailable so the decode driver uses the direct launch path. */
+extern "C" int ds4_gpu_decode_graph_available(void) { return 0; }
+extern "C" int ds4_gpu_decode_graph_begin(void) { return 0; }
+extern "C" int ds4_gpu_decode_graph_end(void) { return 0; }
+extern "C" void ds4_gpu_decode_graph_abort(void) {}
+
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;

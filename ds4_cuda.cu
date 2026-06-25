@@ -211,6 +211,20 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+
+/* CUDA Graph capture state for the single-token decode path. The decode "tape"
+ * is a fixed sequence of kernel launches; capturing it once and replaying it via
+ * cudaGraphLaunch removes per-kernel launch latency and the GPU-idle bubbles
+ * between dependent launches. Only the standard full-residency single-token
+ * decode reaches the capture entry points; every other path (prefill, streaming,
+ * distributed) uses direct launch. Requires -default-stream per-thread so the
+ * decode kernels land on cudaStreamPerThread, which is capturable. */
+static int      g_decode_graph_enabled = -1;        /* -1 until first env read */
+static int      g_decode_graph_capturing;           /* inside cudaStreamBeginCapture */
+static int      g_decode_graph_scratch_overflow;    /* scratch needed to grow mid-capture */
+static uint64_t g_decode_graph_launches;            /* tokens replayed via a graph */
+static uint64_t g_decode_graph_fallbacks;           /* tokens that fell back to direct */
+static int      g_decode_graph_active_logged;       /* one-time "graph active" notice */
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -254,6 +268,15 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+    if (g_decode_graph_capturing) {
+        /* Growing the scratch buffer needs cudaMalloc, which is illegal during
+         * graph capture. Flag it so end-capture discards this graph and the
+         * caller re-runs the token directly (that run performs the real growth,
+         * so the next token captures cleanly). The returned pointer is only
+         * recorded into the discarded graph, never executed, so it is safe. */
+        g_decode_graph_scratch_overflow = 1;
+        return g_cuda_tmp;
+    }
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -2298,6 +2321,17 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
+    if (g_decode_graph_launches || g_decode_graph_fallbacks) {
+        fprintf(stderr,
+                "ds4: CUDA decode graph summary: %llu graph launches, %llu direct fallbacks\n",
+                (unsigned long long)g_decode_graph_launches,
+                (unsigned long long)g_decode_graph_fallbacks);
+    }
+    g_decode_graph_capturing = 0;
+    g_decode_graph_scratch_overflow = 0;
+    g_decode_graph_launches = 0;
+    g_decode_graph_fallbacks = 0;
+    g_decode_graph_active_logged = 0;
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -2498,6 +2532,89 @@ extern "C" int ds4_gpu_end_commands(void) {
 extern "C" int ds4_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "synchronize");
+}
+
+/* ---- CUDA Graph capture for single-token decode (see globals above) ---- */
+
+extern "C" int ds4_gpu_decode_graph_available(void) {
+    if (g_decode_graph_enabled < 0) {
+        const char *e = getenv("DS4_CUDA_GRAPH");
+        /* Opt-in for now; flips to default-on once validated across the sweep. */
+        g_decode_graph_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_decode_graph_enabled;
+}
+
+/* Begin capturing the per-thread default stream. Returns 1 on success (caller
+ * encodes the decode tape, then calls _end), 0 if capture could not start (caller
+ * uses the direct path). */
+extern "C" int ds4_gpu_decode_graph_begin(void) {
+    g_decode_graph_scratch_overflow = 0;
+    cudaError_t e = cudaStreamBeginCapture(cudaStreamPerThread,
+                                           cudaStreamCaptureModeThreadLocal);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_decode_graph_capturing = 0;
+        return 0;
+    }
+    g_decode_graph_capturing = 1;
+    return 1;
+}
+
+/* Discard an in-progress capture without launching (used when the encode failed
+ * mid-tape). Device state is unchanged because capture records but never runs. */
+extern "C" void ds4_gpu_decode_graph_abort(void) {
+    if (!g_decode_graph_capturing) return;
+    g_decode_graph_capturing = 0;
+    cudaGraph_t graph = NULL;
+    (void)cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    if (graph) (void)cudaGraphDestroy(graph);
+    (void)cudaGetLastError();
+    g_decode_graph_fallbacks++;
+}
+
+/* Finish capture and replay the decode tape as a graph. Returns 1 if the graph
+ * launched and completed (logits ready), 0 if capture/instantiate/launch failed
+ * (caller must re-run the token directly; device state is still pristine because
+ * nothing in the capture executed). */
+extern "C" int ds4_gpu_decode_graph_end(void) {
+    if (!g_decode_graph_capturing) return 0;
+    g_decode_graph_capturing = 0;
+
+    cudaGraph_t graph = NULL;
+    cudaError_t e = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    if (e != cudaSuccess || !graph || g_decode_graph_scratch_overflow) {
+        if (graph) (void)cudaGraphDestroy(graph);
+        (void)cudaGetLastError();
+        g_decode_graph_fallbacks++;
+        return 0;
+    }
+
+    cudaGraphExec_t exec = NULL;
+    e = cudaGraphInstantiate(&exec, graph, 0);
+    (void)cudaGraphDestroy(graph);
+    if (e != cudaSuccess || !exec) {
+        if (exec) (void)cudaGraphExecDestroy(exec);
+        (void)cudaGetLastError();
+        g_decode_graph_fallbacks++;
+        return 0;
+    }
+
+    e = cudaGraphLaunch(exec, cudaStreamPerThread);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(cudaStreamPerThread);
+    (void)cudaGraphExecDestroy(exec);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_decode_graph_fallbacks++;
+        return 0;
+    }
+
+    g_decode_graph_launches++;
+    if (!g_decode_graph_active_logged) {
+        g_decode_graph_active_logged = 1;
+        fprintf(stderr, "ds4: CUDA decode graph active (capture+replay)\n");
+    }
+    return 1;
 }
 
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {

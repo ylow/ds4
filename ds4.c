@@ -19473,10 +19473,36 @@ static bool metal_graph_eval_token_raw_swa(
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    /*
+     * CUDA Graph fast path. The decode tape is a fixed kernel sequence, so
+     * capturing it once and replaying it via cudaGraphLaunch removes per-kernel
+     * launch latency and the GPU-idle bubbles between dependent launches.
+     * allow_split_flush must be false here because a mid-tape device sync is
+     * illegal during capture. Any capture failure (e.g. scratch had to grow)
+     * falls through to the direct path below, so results are identical to
+     * non-graph mode. ssd_streaming was handled above, so only the standard
+     * full-residency single-token decode reaches here.
+     */
+    bool ok = false;
+    bool used_graph = false;
+    if (ds4_gpu_decode_graph_available() && ds4_gpu_decode_graph_begin()) {
+        const bool enc = metal_graph_encode_token_raw_swa(
+                g, model, weights, token, pos, logits != NULL, false);
+        if (!enc) {
+            ds4_gpu_decode_graph_abort();
+        } else if (ds4_gpu_decode_graph_end() == 1) {
+            used_graph = true;
+            ok = true;
+        }
+        /* enc ok but graph discarded (e.g. scratch growth): fall through and
+         * re-run this token directly; device state is unchanged by a capture. */
+    }
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (!used_graph) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+    }
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits) {
