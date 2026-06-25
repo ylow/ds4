@@ -10329,7 +10329,11 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * flipped on for CUDA once the read+write paths land, so it can be reverted independently
  * like the F16 macros.
  */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#define DS4_GPU_ATTN_COMP_CACHE_FP8 1
+#else
 #define DS4_GPU_ATTN_COMP_CACHE_FP8 0
+#endif
 
 /*
  * The indexer-compressed KV cache (128-dim per row) is the long-context
@@ -13565,7 +13569,7 @@ static bool metal_graph_decode_kv_store(
                                              DS4_N_ROT) != 0;
 }
 
-static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
+static DS4_MAYBE_UNUSED uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
     return (uint64_t)DS4_N_HEAD_DIM *
            (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
 }

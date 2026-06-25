@@ -4495,7 +4495,15 @@ __global__ static void quantize_comp_f32_to_fp8split_kernel(
             if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
             __syncthreads();
         }
-        int k = (int)ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f));
+        /* Exact ceil(log2(amax/448)) via frexp: avoids the float log2f overshoot that
+         * `ceilf(log2f(2^k))` -> k+1 can produce when the group max is exactly the E4M3
+         * max (448).  That overshoot doubles the scale and pushes small already-quantized
+         * values down into the subnormal grid, breaking value-exactness by ~2^-16.  frexp
+         * is exact and guarantees k <= the staging's own exponent, so v/2^k stays an exact
+         * E4M3 value (shift-up only) and decode reproduces the staged value bit-for-bit. */
+        int e2;
+        float fr = frexpf(fmaxf(scratch[0], 1.0e-4f) / 448.0f, &e2);
+        int k = (fr == 0.5f) ? (e2 - 1) : e2;
         float scale = exp2f((float)k);
         if (off + tid < n_nope)
             nr[off + tid] = dsv4_e4m3fn_encode_dev(fminf(448.0f, fmaxf(-448.0f, v / scale)));
