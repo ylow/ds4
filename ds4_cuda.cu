@@ -219,12 +219,14 @@ static uint64_t g_cuda_tmp_bytes;
  * decode reaches the capture entry points; every other path (prefill, streaming,
  * distributed) uses direct launch. Requires -default-stream per-thread so the
  * decode kernels land on cudaStreamPerThread, which is capturable. */
-static int      g_decode_graph_enabled = -1;        /* -1 until first env read */
-static int      g_decode_graph_capturing;           /* inside cudaStreamBeginCapture */
-static int      g_decode_graph_scratch_overflow;    /* scratch needed to grow mid-capture */
-static uint64_t g_decode_graph_launches;            /* tokens replayed via a graph */
-static uint64_t g_decode_graph_fallbacks;           /* tokens that fell back to direct */
-static int      g_decode_graph_active_logged;       /* one-time "graph active" notice */
+static int             g_decode_graph_enabled = -1;     /* -1 until first env read */
+static int             g_decode_graph_capturing;        /* inside cudaStreamBeginCapture */
+static int             g_decode_graph_scratch_overflow; /* scratch needed to grow mid-capture */
+static cudaGraphExec_t g_decode_graph_exec;             /* reused across tokens via ExecUpdate */
+static uint64_t        g_decode_graph_launches;         /* tokens replayed via a graph */
+static uint64_t        g_decode_graph_reinstantiates;   /* exec rebuilt (topology change) */
+static uint64_t        g_decode_graph_fallbacks;        /* tokens that fell back to direct */
+static int             g_decode_graph_active_logged;    /* one-time "graph active" notice */
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -2321,15 +2323,21 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
+    if (g_decode_graph_exec) {
+        (void)cudaGraphExecDestroy(g_decode_graph_exec);
+        g_decode_graph_exec = NULL;
+    }
     if (g_decode_graph_launches || g_decode_graph_fallbacks) {
         fprintf(stderr,
-                "ds4: CUDA decode graph summary: %llu graph launches, %llu direct fallbacks\n",
+                "ds4: CUDA decode graph summary: %llu launches, %llu reinstantiates, %llu direct fallbacks\n",
                 (unsigned long long)g_decode_graph_launches,
+                (unsigned long long)g_decode_graph_reinstantiates,
                 (unsigned long long)g_decode_graph_fallbacks);
     }
     g_decode_graph_capturing = 0;
     g_decode_graph_scratch_overflow = 0;
     g_decode_graph_launches = 0;
+    g_decode_graph_reinstantiates = 0;
     g_decode_graph_fallbacks = 0;
     g_decode_graph_active_logged = 0;
     for (size_t i = 0; i < 4; i++) {
@@ -2590,21 +2598,44 @@ extern "C" int ds4_gpu_decode_graph_end(void) {
         return 0;
     }
 
-    cudaGraphExec_t exec = NULL;
-    e = cudaGraphInstantiate(&exec, graph, 0);
-    (void)cudaGraphDestroy(graph);
-    if (e != cudaSuccess || !exec) {
-        if (exec) (void)cudaGraphExecDestroy(exec);
-        (void)cudaGetLastError();
-        g_decode_graph_fallbacks++;
-        return 0;
+    /* Reuse the instantiated graph across tokens: patch its parameters in place
+     * with cudaGraphExecUpdate (cheap) instead of re-instantiating every token
+     * (expensive enough to make per-token instantiation a net slowdown).
+     * Topology is identical token-to-token; only kernel args / grid dims change
+     * as position and compressed-row count grow. On the first token, or a rare
+     * topology change (e.g. crossing the sparse-indexer threshold), reinstantiate. */
+    int need_instantiate = 1;
+    if (g_decode_graph_exec) {
+        cudaGraphExecUpdateResultInfo info = {};
+        e = cudaGraphExecUpdate(g_decode_graph_exec, graph, &info);
+        if (e == cudaSuccess && info.result == cudaGraphExecUpdateSuccess) {
+            need_instantiate = 0;
+        } else {
+            (void)cudaGetLastError();
+            (void)cudaGraphExecDestroy(g_decode_graph_exec);
+            g_decode_graph_exec = NULL;
+        }
     }
+    if (need_instantiate) {
+        e = cudaGraphInstantiate(&g_decode_graph_exec, graph, 0);
+        if (e != cudaSuccess || !g_decode_graph_exec) {
+            (void)cudaGetLastError();
+            g_decode_graph_exec = NULL;
+            (void)cudaGraphDestroy(graph);
+            g_decode_graph_fallbacks++;
+            return 0;
+        }
+        g_decode_graph_reinstantiates++;
+    }
+    (void)cudaGraphDestroy(graph);
 
-    e = cudaGraphLaunch(exec, cudaStreamPerThread);
+    e = cudaGraphLaunch(g_decode_graph_exec, cudaStreamPerThread);
     if (e == cudaSuccess) e = cudaStreamSynchronize(cudaStreamPerThread);
-    (void)cudaGraphExecDestroy(exec);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();
+        /* Drop the exec so the next token reinstantiates from a clean capture. */
+        (void)cudaGraphExecDestroy(g_decode_graph_exec);
+        g_decode_graph_exec = NULL;
         g_decode_graph_fallbacks++;
         return 0;
     }
