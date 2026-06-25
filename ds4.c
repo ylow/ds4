@@ -10833,10 +10833,16 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
-        bytes += comp_cap * DS4_N_HEAD_DIM *
-                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+            bytes += comp_cap * ((DS4_N_HEAD_DIM - DS4_N_ROT) + 8u +
+                                 DS4_N_ROT * sizeof(uint16_t));
+        } else {
+            bytes += comp_cap * DS4_N_HEAD_DIM *
+                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        }
         if (ratio == 4) {
-            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM *
+                     (DS4_GPU_INDEX_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
         }
     }
     return bytes;
@@ -10859,10 +10865,11 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_INDEX_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_INDEX_COMP_CACHE_F16 ||
+        DS4_GPU_ATTN_COMP_CACHE_FP8) {
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16)
+        if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8)
             bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
         if (DS4_GPU_INDEX_COMP_CACHE_F16)
             bytes += attn_stage_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
@@ -21716,9 +21723,16 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t layer_comp_cap = ctx / ratio + 2u;
-            m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                  DS4_N_HEAD_DIM *
-                                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+                /* E4M3 NoPE bytes + int8 exponents (8/row) + F16 RoPE tail. */
+                m.compressed_bytes += (uint64_t)layer_comp_cap *
+                                      ((DS4_N_HEAD_DIM - DS4_N_ROT) + 8u +
+                                       DS4_N_ROT * sizeof(uint16_t));
+            } else {
+                m.compressed_bytes += (uint64_t)layer_comp_cap *
+                                      DS4_N_HEAD_DIM *
+                                      (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            }
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
@@ -21731,7 +21745,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
                           m.comp_cap *
                           m.prefill_cap *
                           sizeof(float) +
-                          (DS4_GPU_ATTN_COMP_CACHE_F16
+                          ((DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8)
                                ? attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float) : 0ull) +
                           (DS4_GPU_INDEX_COMP_CACHE_F16
                                ? attn_stage_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float) : 0ull);
@@ -23990,7 +24004,11 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_fp8split(
                     if (av > amax) amax = av;
                 }
                 if (amax < 1.0e-4f) amax = 1.0e-4f;
-                const int k = (int)ceilf(log2f(amax / 448.0f));
+                /* Exact ceil(log2(amax/448)) via frexp (see quantize_comp_f32_to_fp8split_kernel):
+                 * avoids the log2f overshoot that would break reload value-exactness by ~2^-16. */
+                int e2;
+                const float fr = frexpf(amax / 448.0f, &e2);
+                const int k = (fr == 0.5f) ? (e2 - 1) : e2;
                 const float scale = ldexpf(1.0f, k);
                 erow[off >> 6] = (int8_t)k;
                 for (uint32_t i = 0; i < 64u; i++) {
