@@ -87,12 +87,47 @@ F32 kernels unchanged; write side uses `ds4_gpu_tensor_copy_f32_to_f16`. Validat
   grows at extreme length.
 
 ### Remaining follow-ons (in priority order)
-1. **gather-of-selected** expand (indexed layers): dequantize only the top-k selected rows + raw
-   window instead of all n_comp — removes the long-context expand overhead so 800K decode stays
-   fast. (Sequential ratio-128 layers can expand [0,n_comp) as today.)
-2. **Indexer KV (128-dim) → F16**: the long-context indexer-scoring bandwidth hotspot; the WMMA
-   indexer kernels already `__float2half` internally.
+1. **gather-of-selected** expand (indexed layers): DONE (commit 5dc12e6).
+2. **Indexer KV (128-dim) → F16**: **DONE** (commits b4b8e63 read plumbing, 450d513 write staging,
+   d648b6d flip-on). See "Indexer KV → F16 LANDED" below.
 3. **Raw KV → F16**: already F16-rounded (lossless).
-4. **In-kernel __half comp reads** (the templating plan above): recovers attention read bandwidth
-   and removes the expand pass entirely.
+4. **In-kernel __half comp reads** for the *attention* comp cache (the templating plan above):
+   recovers attention read bandwidth and removes the expand pass entirely. (The indexer cache now
+   uses exactly this in-kernel-__half approach — it scores all rows so expand-on-read would save no
+   bandwidth, so reading __half directly was the right call there.)
 5. **Phase 2b — FP8 / TurboQuant ~3-bit** on the 512-dim compressed rows (parallel scale buffers).
+
+## Indexer KV → F16 LANDED (commits b4b8e63, 450d513, d648b6d)
+
+The 128-dim indexer-compressed KV cache is now F16 on CUDA, gated by a dedicated macro
+**`DS4_GPU_INDEX_COMP_CACHE_F16`** (CUDA only; Metal/ROCm/CPU stay F32). Unlike the attention cache
+(expand-on-read), the indexer cache uses **in-kernel `__half` reads**: the indexer scores ALL visible
+compressed rows every step, so expand-on-read would save no bandwidth — reading `__half` directly in
+the 6 scoring kernels both halves the read bytes and lets the WMMA scorers skip the `float`→`__half`
+convert they already did.
+
+Implementation, in three bit-/near-lossless-gated steps:
+- **Read side** (b4b8e63): threaded a runtime `comp_f16` flag through `indexer_scores_kernel`,
+  `indexer_score_one_direct_kernel`, and the 4 WMMA scorers (`index_comp` is now `const void*`;
+  `ld_index_comp_f32`/`ld_index_comp_h` device helpers), their `indexer_scores_launch` dispatcher
+  (element-width-aware size check), and the 3 extern entry points + the 4 ds4.c call sites. Metal
+  defs accept and ignore the flag.
+- **Write side** (450d513): mirrored the attention F16 staging — `index_comp_stage` (F32) +
+  `metal_graph_{store,commit}_index_comp_stage` / `_index_comp_{update_target,update_row,row_view,
+  prefill_target,prefill_target_free}`; routed all indexer-cache writes (single-token decode,
+  prefill zero-prefix, aligned-chunk replay, per-token unaligned) through them (compressor + QAT run
+  in the F32 stage, then commit `copy_f32_to_f16`); handled F16 in session save/load + the cache
+  trace.
+- **Flip on** (d648b6d): macro on for CUDA + F16 cache allocation + memory-estimate/policy fixes so
+  reported "context buffers" stays accurate.
+
+Validated:
+- **Correctness:** teacher-forced perplexity `nll=317.842979423` — **bit-identical** to the
+  F32-indexer baseline (the F16 score rounding didn't change the top-k; n_index_comp=1026 > top_k=512
+  at ctx 4096, so selection is genuinely exercised). Near-lossless.
+- **Memory:** ctx-buffers 410.29 → 405.53 MiB at ctx 4096; 689.04 → 663.22 MiB at ctx ~20.5K
+  (−25.8 MiB). Scales linearly with context.
+- **Speed:** decode neutral at benchable contexts (16384: 13.10→13.06; 20480: 12.97→12.92 tok/s,
+  within noise) — at ≤20K the indexer reads are <1% of the ~9.5 GB/token budget. The bandwidth win
+  only becomes material at hundreds-of-K context (indexer reads grow to ~1 GB/token at 800K), which
+  the 25K-token bench prompt can't reach. Primary value here and now is **memory** (fitting 600–800K).
