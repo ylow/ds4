@@ -10310,7 +10310,11 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * Metal indexer kernels still read F32; flip there once they gain a __half
  * read path).
  */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#define DS4_GPU_INDEX_COMP_CACHE_F16 1
+#else
 #define DS4_GPU_INDEX_COMP_CACHE_F16 0
+#endif
 
 /* =========================================================================
  * Metal Release Graph State.
@@ -10812,10 +10816,13 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_INDEX_COMP_CACHE_F16) {
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
-        bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+        if (DS4_GPU_ATTN_COMP_CACHE_F16)
+            bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+        if (DS4_GPU_INDEX_COMP_CACHE_F16)
+            bytes += attn_stage_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
     }
     return bytes;
 }
@@ -21603,7 +21610,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
-                                      sizeof(float);
+                                      (DS4_GPU_INDEX_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
             }
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
@@ -21612,7 +21619,10 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
                           m.comp_cap *
                           m.prefill_cap *
                           sizeof(float) +
-                          attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+                          (DS4_GPU_ATTN_COMP_CACHE_F16
+                               ? attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float) : 0ull) +
+                          (DS4_GPU_INDEX_COMP_CACHE_F16
+                               ? attn_stage_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float) : 0ull);
     } else {
         m.raw_cap = ds4_default_raw_cap(ctx);
         m.raw_bytes = (uint64_t)DS4_N_LAYER *
