@@ -2483,6 +2483,27 @@ static float dsv4_e4m3fn_dequant_cpu(float x) {
     return sign * dsv4_e4m3fn_value_cpu(best);
 }
 
+/* CPU mirror of dsv4_e4m3fn_encode_dev: the model's E4M3FN byte (bit7 sign, bits0..6 the
+ * magnitude index dsv4_e4m3fn_dequant_cpu would pick) for an already-scaled value.  Used by
+ * the FP8-split session save/load codec so reloaded rows are value-exact. */
+static DS4_MAYBE_UNUSED uint8_t dsv4_e4m3fn_encode_byte_cpu(float x) {
+    const uint8_t sign = x < 0.0f ? 0x80u : 0x00u;
+    const float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value_cpu(mid) <= ax) lo = mid; else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = fabsf(ax - dsv4_e4m3fn_value_cpu(best));
+        const float next_diff = fabsf(ax - dsv4_e4m3fn_value_cpu(best + 1));
+        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) best++;
+    }
+    return sign | (uint8_t)best;
+}
+
 /* DeepSeek V4 stores the non-RoPE part of compressed KV through an E4M3-style
  * round trip.  Keeping this in the CPU reference makes cache values comparable
  * to the Metal graph's compressed-cache behavior. */
@@ -10661,6 +10682,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+        ds4_gpu_tensor_free(g->layer_attn_comp_rope[il]);
+        ds4_gpu_tensor_free(g->layer_attn_comp_scale[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
@@ -11023,7 +11046,8 @@ static bool metal_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_INDEX_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_INDEX_COMP_CACHE_F16 ||
+        DS4_GPU_ATTN_COMP_CACHE_FP8) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
@@ -11102,10 +11126,24 @@ static bool metal_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
-                    managed_kv_cache,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                    (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+            if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+                /* FP8-split: cache holds the E4M3 NoPE bytes; sidecars hold the F16 RoPE
+                 * tail and the per-64-group int8 exponents (8/row, 7 used). */
+                g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * (DS4_N_HEAD_DIM - DS4_N_ROT));
+                g->layer_attn_comp_rope[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_N_ROT * sizeof(uint16_t));
+                g->layer_attn_comp_scale[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * 8u);
+            } else {
+                g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                        (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+            }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {
@@ -11151,7 +11189,7 @@ static bool metal_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) {
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
     }
@@ -11265,6 +11303,9 @@ static bool metal_graph_alloc_raw_cap(
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
             layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
+                             (!DS4_GPU_ATTN_COMP_CACHE_FP8 ||
+                              (g->layer_attn_comp_rope[il] != NULL &&
+                               g->layer_attn_comp_scale[il] != NULL)) &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
                              (!enable_mtp ||
@@ -11291,7 +11332,8 @@ static bool metal_graph_alloc_raw_cap(
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
-                    (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->attn_comp_stage) &&
+                    (!(DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) ||
+                      g->attn_comp_stage) &&
                     (!DS4_GPU_INDEX_COMP_CACHE_F16 || g->index_comp_stage) &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
                     g->comp_mask && g->comp_selected &&
@@ -13563,6 +13605,20 @@ static bool metal_graph_store_attn_comp_stage(
         return false;
     }
 
+#if DS4_GPU_ATTN_COMP_CACHE_FP8
+    /* FP8-split: quantize the staged F32 rows into the E4M3/exponent/F16-RoPE cache.
+     * The quantize entry point is CUDA-only, so this branch is compiled only when the
+     * macro is on (CUDA); other backends keep F16/F32 below. */
+    if (!g->layer_attn_comp_rope[il] || !g->layer_attn_comp_scale[il]) return false;
+    return ds4_gpu_tensor_quantize_f32_to_fp8split(g->layer_attn_comp_cache[il],
+                                                   g->layer_attn_comp_scale[il],
+                                                   g->layer_attn_comp_rope[il],
+                                                   first_row,
+                                                   g->attn_comp_stage,
+                                                   rows,
+                                                   DS4_N_HEAD_DIM,
+                                                   DS4_N_ROT) != 0;
+#else
     const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
     const uint64_t dst_offset = (uint64_t)first_row *
                                 metal_graph_attn_comp_cache_row_bytes();
@@ -13579,18 +13635,19 @@ static bool metal_graph_store_attn_comp_stage(
                                g->attn_comp_stage,
                                0,
                                count * sizeof(float)) != 0;
+#endif
 }
 
 static ds4_gpu_tensor *metal_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16
+    return (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8)
         ? g->attn_comp_stage
         : g->layer_attn_comp_cache[il];
 }
 
 static uint32_t metal_graph_attn_comp_update_row(uint32_t row) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 0u : row;
+    return (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) ? 0u : row;
 }
 
 static bool metal_graph_commit_attn_comp_stage(
@@ -13598,7 +13655,7 @@ static bool metal_graph_commit_attn_comp_stage(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) return true;
+    if (!(DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8)) return true;
     return metal_graph_store_attn_comp_stage(g, il, first_row, rows);
 }
 
@@ -13606,7 +13663,7 @@ static ds4_gpu_tensor *metal_graph_attn_comp_row_view(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       row) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) {
         return ds4_gpu_tensor_view(g->attn_comp_stage,
                                    0,
                                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -13621,7 +13678,7 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) return g->attn_comp_stage;
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) return g->attn_comp_stage;
     const uint32_t view_rows = rows ? rows : 1u;
     return ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
                                (uint64_t)first_row * DS4_N_HEAD_DIM * sizeof(float),
@@ -13629,7 +13686,7 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
 }
 
 static void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) ds4_gpu_tensor_free(t);
+    if (!(DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8)) ds4_gpu_tensor_free(t);
 }
 
 /* Indexer-compressed KV staging, mirroring the attention-compressed helpers
@@ -17918,7 +17975,8 @@ static bool metal_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && n_comp > g->attn_comp_stage_cap) {
+            if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) &&
+                n_comp > g->attn_comp_stage_cap) {
                 fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
             }
@@ -18001,7 +18059,8 @@ static bool metal_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && comp_chunk > g->attn_comp_stage_cap) {
+                if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) &&
+                    comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
@@ -21812,7 +21871,35 @@ static int metal_graph_prompt_logits_test(
                 const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
                 float *gpu_comp = xmalloc((size_t)n * sizeof(float));
                 bool comp_read = false;
-                if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+                    const uint32_t n_nope = DS4_N_HEAD_DIM - DS4_N_ROT;
+                    uint8_t  *cb = xmalloc((size_t)n_comp * n_nope);
+                    int8_t   *xb = xmalloc((size_t)n_comp * 8u);
+                    uint16_t *hb = xmalloc((size_t)n_comp * DS4_N_ROT * sizeof(uint16_t));
+                    if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0, cb,
+                                            (size_t)n_comp * n_nope) != 0 &&
+                        ds4_gpu_tensor_read(g.layer_attn_comp_scale[il], 0, xb,
+                                            (size_t)n_comp * 8u) != 0 &&
+                        ds4_gpu_tensor_read(g.layer_attn_comp_rope[il], 0, hb,
+                                            (size_t)n_comp * DS4_N_ROT * sizeof(uint16_t)) != 0) {
+                        for (uint32_t r = 0; r < n_comp; r++) {
+                            for (uint32_t d = 0; d < DS4_N_HEAD_DIM; d++) {
+                                if (d < n_nope) {
+                                    const uint8_t b = cb[(size_t)r * n_nope + d];
+                                    const float mag = dsv4_e4m3fn_value_cpu((int)(b & 0x7fu));
+                                    gpu_comp[(size_t)r * DS4_N_HEAD_DIM + d] =
+                                        ((b & 0x80u) ? -mag : mag) *
+                                        ldexpf(1.0f, (int)xb[(size_t)r * 8u + (d >> 6)]);
+                                } else {
+                                    gpu_comp[(size_t)r * DS4_N_HEAD_DIM + d] =
+                                        f16_to_f32(hb[(size_t)r * DS4_N_ROT + (d - n_nope)]);
+                                }
+                            }
+                        }
+                        comp_read = true;
+                    }
+                    free(cb); free(xb); free(hb);
+                } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
                     uint16_t *gpu_comp_h = xmalloc((size_t)n * sizeof(uint16_t));
                     if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
                                             gpu_comp_h, n * sizeof(uint16_t)) != 0) {
@@ -23803,6 +23890,127 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
     }
     return 0;
 }
+
+/* FP8-split session I/O: the stable on-disk format stays F32 (n_rows x DS4_N_HEAD_DIM
+ * floats per layer).  Save decodes the E4M3/exponent/F16-RoPE cache to F32; load
+ * re-quantizes F32 back into the three device buffers (value-exact on round-trip). */
+static DS4_MAYBE_UNUSED int payload_write_tensor_span_fp8split_as_f32(
+        FILE *fp, const ds4_gpu_tensor *nope, const ds4_gpu_tensor *expo,
+        const ds4_gpu_tensor *rope, uint64_t n_rows, uint8_t *buf, size_t cap,
+        char *err, size_t errlen) {
+    if (!nope || !expo || !rope) {
+        payload_set_err(err, errlen, "missing FP8-split session tensor");
+        return 1;
+    }
+    const uint32_t n_nope = DS4_N_HEAD_DIM - DS4_N_ROT;
+    const size_t per_row = (size_t)n_nope + 8u + (size_t)DS4_N_ROT * sizeof(uint16_t) +
+                           (size_t)DS4_N_HEAD_DIM * sizeof(float);
+    const size_t rows_chunk = cap / per_row;
+    if (rows_chunk == 0) {
+        payload_set_err(err, errlen, "session conversion buffer too small for FP8-split");
+        return 1;
+    }
+    uint8_t  *nb = buf;
+    int8_t   *eb = (int8_t *)(buf + rows_chunk * n_nope);
+    uint16_t *rb = (uint16_t *)(void *)(buf + rows_chunk * ((size_t)n_nope + 8u));
+    float    *fb = (float *)(void *)(buf + rows_chunk *
+                   ((size_t)n_nope + 8u + (size_t)DS4_N_ROT * sizeof(uint16_t)));
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_chunk ? rows_chunk
+                                                              : (size_t)(n_rows - done);
+        if (ds4_gpu_tensor_read(nope, done * n_nope, nb, n * n_nope) == 0 ||
+            ds4_gpu_tensor_read(expo, done * 8u, eb, n * 8u) == 0 ||
+            ds4_gpu_tensor_read(rope, done * DS4_N_ROT * sizeof(uint16_t), rb,
+                                n * DS4_N_ROT * sizeof(uint16_t)) == 0) {
+            payload_set_err(err, errlen, "failed to read FP8-split session tensor");
+            return 1;
+        }
+        for (size_t r = 0; r < n; r++) {
+            float          *frow = fb + r * DS4_N_HEAD_DIM;
+            const uint8_t  *nrow = nb + r * n_nope;
+            const int8_t   *erow = eb + r * 8u;
+            const uint16_t *rrow = rb + r * DS4_N_ROT;
+            for (uint32_t d = 0; d < n_nope; d++) {
+                const uint8_t b = nrow[d];
+                const float mag = dsv4_e4m3fn_value_cpu((int)(b & 0x7fu));
+                frow[d] = ((b & 0x80u) ? -mag : mag) * ldexpf(1.0f, (int)erow[d >> 6]);
+            }
+            for (uint32_t d = 0; d < DS4_N_ROT; d++) {
+                frow[n_nope + d] = f16_to_f32(rrow[d]);
+            }
+        }
+        if (payload_write_bytes(fp, fb, (uint64_t)n * DS4_N_HEAD_DIM * sizeof(float),
+                                err, errlen) != 0) return 1;
+        done += n;
+    }
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_fp8split(
+        FILE *fp, ds4_gpu_tensor *nope, ds4_gpu_tensor *expo, ds4_gpu_tensor *rope,
+        uint64_t n_rows, uint8_t *buf, size_t cap, uint64_t *remaining,
+        char *err, size_t errlen) {
+    if (!nope || !expo || !rope) {
+        payload_set_err(err, errlen, "missing FP8-split session tensor");
+        return 1;
+    }
+    const uint32_t n_nope = DS4_N_HEAD_DIM - DS4_N_ROT;
+    const size_t per_row = (size_t)n_nope + 8u + (size_t)DS4_N_ROT * sizeof(uint16_t) +
+                           (size_t)DS4_N_HEAD_DIM * sizeof(float);
+    const size_t rows_chunk = cap / per_row;
+    if (rows_chunk == 0) {
+        payload_set_err(err, errlen, "session conversion buffer too small for FP8-split");
+        return 1;
+    }
+    uint8_t  *nb = buf;
+    int8_t   *eb = (int8_t *)(buf + rows_chunk * n_nope);
+    uint16_t *rb = (uint16_t *)(void *)(buf + rows_chunk * ((size_t)n_nope + 8u));
+    float    *fb = (float *)(void *)(buf + rows_chunk *
+                   ((size_t)n_nope + 8u + (size_t)DS4_N_ROT * sizeof(uint16_t)));
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_chunk ? rows_chunk
+                                                              : (size_t)(n_rows - done);
+        if (payload_read_bytes(fp, fb, (uint64_t)n * DS4_N_HEAD_DIM * sizeof(float),
+                               remaining, err, errlen) != 0) return 1;
+        for (size_t r = 0; r < n; r++) {
+            const float *frow = fb + r * DS4_N_HEAD_DIM;
+            uint8_t  *nrow = nb + r * n_nope;
+            int8_t   *erow = eb + r * 8u;
+            uint16_t *rrow = rb + r * DS4_N_ROT;
+            for (uint32_t off = 0; off < n_nope; off += 64u) {
+                float amax = 0.0f;
+                for (uint32_t i = 0; i < 64u; i++) {
+                    const float av = fabsf(frow[off + i]);
+                    if (av > amax) amax = av;
+                }
+                if (amax < 1.0e-4f) amax = 1.0e-4f;
+                const int k = (int)ceilf(log2f(amax / 448.0f));
+                const float scale = ldexpf(1.0f, k);
+                erow[off >> 6] = (int8_t)k;
+                for (uint32_t i = 0; i < 64u; i++) {
+                    float v = frow[off + i] / scale;
+                    if (v > 448.0f) v = 448.0f;
+                    if (v < -448.0f) v = -448.0f;
+                    nrow[off + i] = dsv4_e4m3fn_encode_byte_cpu(v);
+                }
+            }
+            for (uint32_t d = 0; d < DS4_N_ROT; d++) {
+                rrow[d] = f32_to_f16(frow[n_nope + d]);
+            }
+        }
+        if (ds4_gpu_tensor_write(nope, done * n_nope, nb, n * n_nope) == 0 ||
+            ds4_gpu_tensor_write(expo, done * 8u, eb, n * 8u) == 0 ||
+            ds4_gpu_tensor_write(rope, done * DS4_N_ROT * sizeof(uint16_t), rb,
+                                 n * DS4_N_ROT * sizeof(uint16_t)) == 0) {
+            payload_set_err(err, errlen, "failed to restore FP8-split session tensor");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
 #endif
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
@@ -23960,7 +24168,17 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+            rc = payload_write_tensor_span_fp8split_as_f32(fp,
+                                                           g->layer_attn_comp_cache[il],
+                                                           g->layer_attn_comp_scale[il],
+                                                           g->layer_attn_comp_rope[il],
+                                                           g->layer_n_comp[il],
+                                                           buf,
+                                                           DS4_SESSION_IO_CHUNK,
+                                                           err,
+                                                           errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
                                                       0,
@@ -24172,7 +24390,18 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+            rc = payload_read_tensor_span_f32_as_fp8split(fp,
+                                                          g->layer_attn_comp_cache[il],
+                                                          g->layer_attn_comp_scale[il],
+                                                          g->layer_attn_comp_rope[il],
+                                                          n_comp[i],
+                                                          buf,
+                                                          DS4_SESSION_IO_CHUNK,
+                                                          &remaining,
+                                                          err,
+                                                          errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
                                                      0,
@@ -24667,7 +24896,17 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+            rc = payload_write_tensor_span_fp8split_as_f32(fp,
+                                                           g->layer_attn_comp_cache[il],
+                                                           g->layer_attn_comp_scale[il],
+                                                           g->layer_attn_comp_rope[il],
+                                                           g->layer_n_comp[il],
+                                                           buf,
+                                                           DS4_SESSION_IO_CHUNK,
+                                                           err,
+                                                           errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
                                                       0,
@@ -25014,7 +25253,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+            rc = payload_read_tensor_span_f32_as_fp8split(fp,
+                                                          g->layer_attn_comp_cache[il],
+                                                          g->layer_attn_comp_scale[il],
+                                                          g->layer_attn_comp_rope[il],
+                                                          n_comp[il],
+                                                          buf,
+                                                          DS4_SESSION_IO_CHUNK,
+                                                          &remaining,
+                                                          err,
+                                                          errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
                                                      0,

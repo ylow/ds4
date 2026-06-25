@@ -4450,6 +4450,82 @@ __global__ static void gather_comp_fp8_to_f32_kernel(
     }
 }
 
+/* Encode an already-scaled value (|x| clamped to 448) to the model's E4M3FN byte:
+ * bit7 = sign, bits0..6 = the magnitude index `best` that dsv4_e4m3fn_dequant_dev would
+ * pick (same binary search + tie-break), so the stored byte is bit-faithful to the model. */
+__device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
+    uint8_t sign = (x < 0.0f) ? 0x80u : 0x00u;
+    float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value_dev(mid) <= ax) lo = mid; else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        float bd = fabsf(ax - dsv4_e4m3fn_value_dev(best));
+        float nd = fabsf(ax - dsv4_e4m3fn_value_dev(best + 1));
+        if (nd < bd || (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) best++;
+    }
+    return sign | (uint8_t)best;
+}
+
+/* Commit `rows` staged F32 comp rows (head_dim each) to the FP8-split cache.  Re-runs the
+ * model's per-64-group quantizer (cf. fp8_kv_quantize_kernel) emitting (E4M3 byte, int8
+ * exponent) for the 448 NoPE dims and F16 for the 64 RoPE tail.  Value-exact: decode
+ * reproduces the staged (already-QAT'd) value bit-for-bit.  One block/row, 64 threads. */
+__global__ static void quantize_comp_f32_to_fp8split_kernel(
+        uint8_t *nope_out, int8_t *exp_out, __half *rope_out, uint64_t first_row,
+        const float *src, uint32_t rows, uint32_t head_dim, uint32_t n_rot) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;                 /* 0..63 */
+    if (row >= rows) return;
+    const uint32_t n_nope = head_dim - n_rot;         /* 448 */
+    const float *xr = src + (uint64_t)row * head_dim;
+    uint8_t *nr = nope_out + ((uint64_t)first_row + row) * n_nope;
+    int8_t  *er = exp_out  + ((uint64_t)first_row + row) * 8u;
+    __half  *rr = rope_out + ((uint64_t)first_row + row) * n_rot;
+    __shared__ float scratch[64];
+    uint32_t gi = 0;
+    for (uint32_t off = 0; off < n_nope; off += 64u, gi++) {
+        float v = (off + tid < n_nope) ? xr[off + tid] : 0.0f;
+        scratch[tid] = (off + tid < n_nope) ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        int k = (int)ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f));
+        float scale = exp2f((float)k);
+        if (off + tid < n_nope)
+            nr[off + tid] = dsv4_e4m3fn_encode_dev(fminf(448.0f, fmaxf(-448.0f, v / scale)));
+        if (tid == 0) er[gi] = (int8_t)k;
+        __syncthreads();
+    }
+    for (uint32_t d = tid; d < n_rot; d += 64u)
+        rr[d] = __float2half(xr[n_nope + d]);
+}
+
+/* Quantize `rows` staged F32 comp rows into the FP8-split cache at row offset first_row.
+ * Backend-agnostic entry called from the shared ds4.c staging commit. */
+extern "C" int ds4_gpu_tensor_quantize_f32_to_fp8split(
+        ds4_gpu_tensor *nope, ds4_gpu_tensor *expo, ds4_gpu_tensor *rope, uint64_t first_row,
+        const ds4_gpu_tensor *src_stage, uint32_t rows, uint32_t head_dim, uint32_t n_rot) {
+    if (!nope || !expo || !rope || !src_stage) return 0;
+    if (rows == 0) return 1;
+    if (n_rot >= head_dim) return 0;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint64_t need_nope = ((uint64_t)first_row + rows) * n_nope;
+    const uint64_t need_exp  = ((uint64_t)first_row + rows) * 8u;
+    const uint64_t need_rope = ((uint64_t)first_row + rows) * n_rot * sizeof(__half);
+    if (nope->bytes < need_nope || expo->bytes < need_exp || rope->bytes < need_rope ||
+        src_stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
+    quantize_comp_f32_to_fp8split_kernel<<<rows, 64>>>(
+            (uint8_t *)nope->ptr, (int8_t *)expo->ptr, (__half *)rope->ptr, first_row,
+            (const float *)src_stage->ptr, rows, head_dim, n_rot);
+    return cuda_ok(cudaGetLastError(), "quantize f32->fp8split");
+}
+
 __device__ static float dsv4_e2m1fn_value_dev(int i) {
     switch (i & 7) {
     case 0: return 0.0f;

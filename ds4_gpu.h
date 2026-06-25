@@ -38,6 +38,14 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
 
+/* Quantize staged F32 compressed-attention rows into the FP8-split cache: NoPE dims ->
+ * model E4M3 byte (`nope`) + per-64-group int8 exponent (`expo`), RoPE tail -> F16 (`rope`),
+ * at row offset `first_row`.  See DS4_GPU_ATTN_COMP_CACHE_FP8. */
+int ds4_gpu_tensor_quantize_f32_to_fp8split(ds4_gpu_tensor *nope, ds4_gpu_tensor *expo,
+                                            ds4_gpu_tensor *rope, uint64_t first_row,
+                                            const ds4_gpu_tensor *src_stage, uint32_t rows,
+                                            uint32_t head_dim, uint32_t n_rot);
+
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
