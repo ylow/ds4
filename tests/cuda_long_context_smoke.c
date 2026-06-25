@@ -125,7 +125,10 @@ static int check_decode_attention_overflow_path(void) {
                                               n_raw,
                                               0,
                                               comp,
-                                              0,
+                                              0,    /* comp_kv_dtype = F32 */
+                                              NULL, /* comp_rope  */
+                                              NULL, /* comp_scale */
+                                              0,    /* comp_n_rot */
                                               n_comp,
                                               NULL,
                                               0,

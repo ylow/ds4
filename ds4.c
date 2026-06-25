@@ -10299,6 +10299,18 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #endif
 
 /*
+ * FP8-split storage for the attention-compressed KV cache.  The NoPE 448 dims are
+ * stored as the model's own E4M3 byte (dsv4_fp8_kv_quantize already rounds them in
+ * 7 groups of 64 with a power-of-2 scale) plus a per-64-group int8 exponent, and the
+ * 64-dim RoPE tail stays F16.  Bit-exact to the F32 reference for the NoPE dims (the
+ * rounding is already in the reference), RoPE F16 like the F16 cache.  Takes PRECEDENCE
+ * over _F16 when on (every attn-comp site checks FP8 first).  Default OFF everywhere;
+ * flipped on for CUDA once the read+write paths land, so it can be reverted independently
+ * like the F16 macros.
+ */
+#define DS4_GPU_ATTN_COMP_CACHE_FP8 0
+
+/*
  * The indexer-compressed KV cache (128-dim per row) is the long-context
  * indexer-scoring bandwidth hotspot: every decode/prefill step scores ALL
  * visible compressed rows.  Storing it F16 halves both its memory and the
@@ -10353,6 +10365,10 @@ typedef struct {
      * the row counters whenever a checkpoint is saved or partially rewound. */
     ds4_gpu_tensor *layer_raw_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_MAX_LAYER];
+    /* FP8-split mode only (DS4_GPU_ATTN_COMP_CACHE_FP8): sidecars to layer_attn_comp_cache,
+     * which then holds the E4M3 NoPE bytes.  RoPE tail F16 + per-64-group int8 exponents. */
+    ds4_gpu_tensor *layer_attn_comp_rope[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_attn_comp_scale[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
@@ -13512,8 +13528,17 @@ static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
            (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
 }
 
-static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
+/* Storage dtype the attention entry points use for the compressed-attention KV cache:
+ * 0 = F32, 1 = F16, 2 = FP8-split (NoPE E4M3 byte + per-group exponent, RoPE F16).
+ * FP8 takes precedence over F16 when both macros are on (CUDA). */
+static uint32_t metal_graph_attn_comp_cache_dtype(void) {
+#if DS4_GPU_ATTN_COMP_CACHE_FP8
+    return 2u;
+#elif DS4_GPU_ATTN_COMP_CACHE_F16
+    return 1u;
+#else
+    return 0u;
+#endif
 }
 
 static uint64_t metal_graph_index_comp_cache_row_bytes(void) {
@@ -15509,7 +15534,10 @@ static bool metal_graph_encode_decode_layer(
                     g->q,
                     raw_cache,
                     g->layer_attn_comp_cache[il],
-                    metal_graph_attn_comp_cache_is_f16(),
+                    metal_graph_attn_comp_cache_dtype(),
+                    g->layer_attn_comp_rope[il],
+                    g->layer_attn_comp_scale[il],
+                    DS4_N_ROT,
                     comp_selected,
                     1,
                     pos,
@@ -15538,7 +15566,10 @@ static bool metal_graph_encode_decode_layer(
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
-                                                         metal_graph_attn_comp_cache_is_f16(),
+                                                         metal_graph_attn_comp_cache_dtype(),
+                                                         g->layer_attn_comp_rope[il],
+                                                         g->layer_attn_comp_scale[il],
+                                                         DS4_N_ROT,
                                                          n_comp,
                                                          NULL,
                                                          0,
@@ -18528,7 +18559,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->batch_q,
                                                                               g->layer_raw_cache[il],
                                                                               g->layer_attn_comp_cache[il],
-                                                                              metal_graph_attn_comp_cache_is_f16(),
+                                                                              metal_graph_attn_comp_cache_dtype(),
+                                                                              g->layer_attn_comp_rope[il],
+                                                                              g->layer_attn_comp_scale[il],
+                                                                              DS4_N_ROT,
                                                                               g->comp_selected,
                                                                               n_tokens,
                                                                               pos0,
@@ -18557,7 +18591,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->batch_q,
                                                                              g->layer_raw_cache[il],
                                                                              g->layer_attn_comp_cache[il],
-                                                                             metal_graph_attn_comp_cache_is_f16(),
+                                                                             metal_graph_attn_comp_cache_dtype(),
+                                                                             g->layer_attn_comp_rope[il],
+                                                                             g->layer_attn_comp_scale[il],
+                                                                             DS4_N_ROT,
                                                                              use_comp_mask ? g->comp_mask : NULL,
                                                                              use_comp_mask,
                                                                              n_tokens,
@@ -18643,7 +18680,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           g->batch_q,
                                                                           g->layer_raw_cache[il],
                                                                           g->layer_attn_comp_cache[il],
-                                                                          metal_graph_attn_comp_cache_is_f16(),
+                                                                          metal_graph_attn_comp_cache_dtype(),
+                                                                          g->layer_attn_comp_rope[il],
+                                                                          g->layer_attn_comp_scale[il],
+                                                                          DS4_N_ROT,
                                                                           g->comp_selected,
                                                                           n_tokens,
                                                                           pos0,
@@ -18675,7 +18715,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                        g->batch_q,
                                                                        g->batch_kv,
                                                                        g->layer_attn_comp_cache[il],
-                                                                       metal_graph_attn_comp_cache_is_f16(),
+                                                                       metal_graph_attn_comp_cache_dtype(),
+                                                                       g->layer_attn_comp_rope[il],
+                                                                       g->layer_attn_comp_scale[il],
+                                                                       DS4_N_ROT,
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
@@ -18771,7 +18814,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
                                                                               g->layer_attn_comp_cache[il],
-                                                                              metal_graph_attn_comp_cache_is_f16(),
+                                                                              metal_graph_attn_comp_cache_dtype(),
+                                                                              g->layer_attn_comp_rope[il],
+                                                                              g->layer_attn_comp_scale[il],
+                                                                              DS4_N_ROT,
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -18795,7 +18841,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  g->raw_cap,
                                                                  raw_start,
                                                                  cur_comp ? g->layer_attn_comp_cache[il] : NULL,
-                                                                 metal_graph_attn_comp_cache_is_f16(),
+                                                                 metal_graph_attn_comp_cache_dtype(),
+                                                                 g->layer_attn_comp_rope[il],
+                                                                 g->layer_attn_comp_scale[il],
+                                                                 DS4_N_ROT,
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,
