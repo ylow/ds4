@@ -186,3 +186,37 @@ with `make ds4 ds4-bench CUDA_ARCH=` (ds4.c relinks fast; ds4_cuda.cu re-runs nv
   (run-to-run nondeterministic); only teacher-forced perplexity is bit-deterministic.
 - Decode is GPU-bound at benchable ctx, and the indexer bandwidth win only showed at
   hundreds-of-K ctx — so the **near-term FP8 win is MEMORY**, not tok/s at 4K–25K.
+
+## Status — LANDED (bit-identical to F16, ~1.75× less cache)
+
+Commits: `582c3ad` read plumbing (inert), `c8da47c` write/commit/buffers/save-load/trace
+(inert), `bf7c814` flip-on + the exact-exponent fix, `53b8e7e` memory accounting + reload
+codec + indexer over-estimate fix. Built with `make cuda-spark` (ds4-server rebuilt).
+
+**Result: teacher-forced nll = 317.842979423 @ ctx 4096 — BIT-IDENTICAL to the F16
+build.** The FP8-split comp-attn KV is exactly as accurate as F16 (F16 is itself lossless
+on the model's E4M3-quantized NoPE values), at **396.21 MiB context buffers vs 405.53
+(F16) @ ctx 4096** (the comp cache: F16 21.0 MiB → FP8-split 12.0 MiB; ~9 MiB saved,
+linear in ctx → ~0.6 GB @128K, multi-GB toward 800K). So this is a **memory** win at zero
+quality cost, not the 0.5%-lossy tradeoff originally budgeted.
+
+**The validation bug (worth remembering).** The first flip-on gave nll 317.158649 — a
+0.68 drift that *passed* the ≤319.4 gate but contradicted the predicted bit-identity.
+Root cause: the commit re-quantizes the already-QAT'd F32 staging and recomputed the
+per-64-group exponent with `(int)ceilf(log2f(amax/448))`. When a group's max equals the
+E4M3 max (448), `amax/448 == 2^k` exactly but `log2f(2^k)` returns `k + 1ulp`, so `ceilf`
+yields `k+1`; the scale doubles and small already-quantized values shift down into the
+E4M3 subnormal grid, losing **2⁻¹⁶** on a handful of values. That tiny seed compounds
+chaotically over the perplexity's 255 teacher-forced **decode** steps (the comp cache is
+rebuilt from the model's own hidden states — a recurrence), inflating to 0.68 nll.
+Methodology lesson: a passing tolerance gate is NOT proof of correctness here; the comp
+cache must be verified **value-exact** (decode == staged value, bit-for-bit), because the
+recurrent decode amplifies sub-ulp differences. **Fix:** compute the exponent with
+`frexpf` (exact `ceil(log2)`, no overshoot), which provably yields `k ≤` the staging's own
+exponent (shift-up only) so decode reproduces the staged value exactly. Applied to both
+the commit kernel and the CPU session-load codec.
+
+**Follow-ons (unchanged priority):** in-kernel `__half`/FP8 reads for the *attention* comp
+cache (recover read bandwidth, drop the expand pass — the indexer already does this);
+raw-KV → F16 (lossless, low value); then TurboQuant (~3-bit) on the 512-dim rows, which
+reuses this split row layout + per-group scale buffers.
