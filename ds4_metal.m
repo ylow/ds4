@@ -12222,10 +12222,14 @@ int ds4_gpu_indexer_score_one_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *index_comp,
+        uint32_t                index_comp_f16,
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale) {
+    /* Metal keeps the indexer-compressed cache in F32; the F16 flag exists for
+     * the CUDA path only (DS4_GPU_INDEX_COMP_CACHE_F16). */
+    (void)index_comp_f16;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_head == 0 || head_dim == 0) {
@@ -12479,12 +12483,14 @@ int ds4_gpu_indexer_scores_prefill_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *index_comp,
+        uint32_t                index_comp_f16,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    (void)index_comp_f16;
     return ds4_gpu_indexer_scores_batch_tensor(scores,
                                                  q,
                                                  weights,
@@ -12503,6 +12509,7 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *index_comp,
+        uint32_t                index_comp_f16,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -12510,6 +12517,7 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    (void)index_comp_f16;
     return ds4_gpu_indexer_scores_batch_tensor(scores,
                                                  q,
                                                  weights,

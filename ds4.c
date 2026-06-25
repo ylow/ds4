@@ -10298,6 +10298,20 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0
 #endif
 
+/*
+ * The indexer-compressed KV cache (128-dim per row) is the long-context
+ * indexer-scoring bandwidth hotspot: every decode/prefill step scores ALL
+ * visible compressed rows.  Storing it F16 halves both its memory and the
+ * read bandwidth of the scoring kernels (which already convert to __half
+ * internally for the WMMA path).  Like the attention cache, writes are staged
+ * in F32 (pool/normalize/RoPE/QAT) and committed F16; the scoring kernels read
+ * __half directly.  Kept as a separate lever so it can be flipped/reverted
+ * independently of the attention cache.  Enabled for CUDA only for now (the
+ * Metal indexer kernels still read F32; flip there once they gain a __half
+ * read path).
+ */
+#define DS4_GPU_INDEX_COMP_CACHE_F16 0
+
 /* =========================================================================
  * Metal Release Graph State.
  * =========================================================================
@@ -13487,6 +13501,15 @@ static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
 }
 
+static DS4_MAYBE_UNUSED uint64_t metal_graph_index_comp_cache_row_bytes(void) {
+    return (uint64_t)DS4_N_INDEXER_HEAD_DIM *
+           (DS4_GPU_INDEX_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+}
+
+static uint32_t metal_graph_index_comp_cache_is_f16(void) {
+    return DS4_GPU_INDEX_COMP_CACHE_F16 ? 1u : 0u;
+}
+
 static bool metal_graph_store_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -15301,6 +15324,7 @@ static bool metal_graph_encode_decode_layer(
                                                                 g->indexer_q,
                                                                 g->indexer_weights,
                                                                 g->layer_index_comp_cache[il],
+                                                                metal_graph_index_comp_cache_is_f16(),
                                                                 g->layer_n_index_comp[il],
                                                                 DS4_N_INDEXER_HEAD,
                                                                 DS4_N_INDEXER_HEAD_DIM,
@@ -18331,6 +18355,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                   g->batch_indexer_q,
                                                                   g->batch_indexer_weights,
                                                                   g->layer_index_comp_cache[il],
+                                                                  metal_graph_index_comp_cache_is_f16(),
                                                                   n_comp,
                                                                   n_tokens,
                                                                   pos0,
@@ -18452,6 +18477,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          g->batch_indexer_q,
                                                          g->batch_indexer_weights,
                                                          g->layer_index_comp_cache[il],
+                                                         metal_graph_index_comp_cache_is_f16(),
                                                          n_comp,
                                                          n_tokens,
                                                          DS4_N_INDEXER_HEAD,
@@ -18587,6 +18613,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             indexer_q_view,
                                                             indexer_w_view,
                                                             g->layer_index_comp_cache[il],
+                                                            metal_graph_index_comp_cache_is_f16(),
                                                             cur_index,
                                                             DS4_N_INDEXER_HEAD,
                                                             DS4_N_INDEXER_HEAD_DIM,
