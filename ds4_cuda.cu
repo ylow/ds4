@@ -212,6 +212,11 @@ static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
 
+/* Reused F32 scratch for F16 compressed-KV expand-on-read (see cuda_expand_comp_f16_to_f32). */
+static void          *g_comp_f32_expand_ptr;
+static uint64_t       g_comp_f32_expand_bytes;
+static ds4_gpu_tensor g_comp_f32_expand_view;
+
 /* CUDA Graph capture state for the single-token decode path. The decode "tape"
  * is a fixed sequence of kernel launches; capturing it once and replaying it via
  * cudaGraphLaunch removes per-kernel launch latency and the GPU-idle bubbles
@@ -2323,6 +2328,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
+    if (g_comp_f32_expand_ptr) {
+        (void)cudaFree(g_comp_f32_expand_ptr);
+        g_comp_f32_expand_ptr = NULL;
+        g_comp_f32_expand_bytes = 0;
+    }
     if (g_decode_graph_exec) {
         (void)cudaGraphExecDestroy(g_decode_graph_exec);
         g_decode_graph_exec = NULL;
@@ -3681,6 +3691,34 @@ __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(x[i]);
+}
+
+__global__ static void f16_to_f32_kernel(float *out, const __half *x, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(x[i]);
+}
+
+/* Narrowing copy for the F16 compressed-KV cache staging (write side): read `count`
+ * f32 elements from src (byte offset src_offset) and write them as f16 into dst (byte
+ * offset dst_offset). Byte offsets / element count match the Metal backend semantics
+ * so the shared ds4.c staging code is backend-agnostic. */
+extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                              const ds4_gpu_tensor *src, uint64_t src_offset,
+                                              uint64_t count) {
+    if (!dst || !src) return 0;
+    if (count == 0) return 1;
+    if (count > UINT64_MAX / sizeof(float) || count > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t src_bytes = count * sizeof(float);
+    const uint64_t dst_bytes = count * sizeof(uint16_t);
+    if (src_offset > src->bytes || src_bytes > src->bytes - src_offset ||
+        dst_offset > dst->bytes || dst_bytes > dst->bytes - dst_offset) {
+        return 0;
+    }
+    f32_to_f16_kernel<<<(unsigned)((count + 255u) / 256u), 256>>>(
+            (__half *)((char *)dst->ptr + dst_offset),
+            (const float *)((const char *)src->ptr + src_offset),
+            count);
+    return cuda_ok(cudaGetLastError(), "tensor copy f32->f16");
 }
 
 __device__ static float warp_sum_f32(float v) {
@@ -8782,6 +8820,38 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
             0, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor state set launch");
 }
+/* F16 compressed-KV expand-on-read: when the compressed attention cache is stored
+ * as F16, dequantize its first n_comp rows into a reused F32 scratch so the existing
+ * (trusted) F32 attention kernels run unchanged. Returns a tensor view over the
+ * scratch, or NULL on failure. Separate from g_cuda_tmp so it never collides with a
+ * call's own attention scratch. Expands all n_comp rows — fine at moderate context;
+ * a gather-of-selected variant is the long-context optimization. */
+static const ds4_gpu_tensor *cuda_expand_comp_f16_to_f32(const ds4_gpu_tensor *comp_f16,
+                                                         uint32_t n_comp, uint32_t head_dim) {
+    if (!comp_f16 || n_comp == 0u || head_dim == 0u) return NULL;
+    const uint64_t count = (uint64_t)n_comp * head_dim;
+    if (comp_f16->bytes < count * sizeof(__half)) return NULL;
+    const uint64_t bytes = count * sizeof(float);
+    if (g_comp_f32_expand_bytes < bytes) {
+        if (g_comp_f32_expand_ptr) (void)cudaFree(g_comp_f32_expand_ptr);
+        g_comp_f32_expand_ptr = NULL;
+        g_comp_f32_expand_bytes = 0;
+        if (cudaMalloc(&g_comp_f32_expand_ptr, (size_t)bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_comp_f32_expand_ptr = NULL;
+            return NULL;
+        }
+        g_comp_f32_expand_bytes = bytes;
+    }
+    f16_to_f32_kernel<<<(unsigned)((count + 255u) / 256u), 256>>>(
+            (float *)g_comp_f32_expand_ptr, (const __half *)comp_f16->ptr, count);
+    if (!cuda_ok(cudaGetLastError(), "comp f16->f32 expand")) return NULL;
+    g_comp_f32_expand_view.ptr = g_comp_f32_expand_ptr;
+    g_comp_f32_expand_view.bytes = g_comp_f32_expand_bytes;
+    g_comp_f32_expand_view.owner = 0;
+    return &g_comp_f32_expand_view;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -8799,6 +8869,14 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (comp_kv_f16) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_f16 = 0;
+    }
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
@@ -9086,7 +9164,14 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
+    if (comp_kv_f16) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_f16 = 0;
+    }
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
@@ -9114,6 +9199,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (comp_kv_f16) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_f16 = 0;
+    }
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -9364,7 +9457,14 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
+    if (comp_kv_f16) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_f16 = 0;
+    }
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
@@ -9386,7 +9486,14 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
+    if (comp_kv_f16) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_f16 = 0;
+    }
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);

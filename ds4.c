@@ -10292,7 +10292,7 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * than a semantic approximation: all Metal attention consumers already run the
  * compressed K/V rows through F16 FlashAttention/indexed-attention paths.
  */
-#if defined(__APPLE__)
+#if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
 #define DS4_GPU_ATTN_COMP_CACHE_F16 1
 #else
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0
