@@ -156,3 +156,38 @@ user before long sweeps.
 - Scratch growth causing in-capture `cudaMalloc` (handled by capture-failure fallback).
 - Gain may land at the low end (~1.1×) if decode is already mostly GPU-bound; acceptable —
   this phase also exists to build the harness for the higher-impact KV/indexer phase.
+
+## RESULTS (2026-06-25) — implemented, correct, but NO speedup
+
+Implemented as specified and validated on the GB10. Correctness is perfect; speed is a wash.
+
+**Correctness (bit-exact):** teacher-forced perplexity (the only run-to-run *deterministic*
+oracle — greedy decode is nondeterministic because non-associative GPU reductions flip near-tie
+argmaxes) gives `nll=317.843967992` identically graphs-off and graphs-on, at ctx 2048 and 16384,
+with 0 direct fallbacks. cuBLAS turned out to be `n_tok>1`-only, so single-token decode is
+cuBLAS-free and captures cleanly. `-default-stream per-thread` is numerically safe.
+
+**Speed (the decisive experiment), ctx 2048, 64–128 gen tok:**
+| Config | gen tok/s |
+|---|---|
+| OFF, split-flush=4 (default pipelined) | 13.39 |
+| OFF, split-flush=0 (no pipelining, raw launch overhead exposed) | 13.52 |
+| ON, CUDA graphs | 13.55 |
+
+All within ~1% noise. **Disabling the encode/execute pipelining (split=0) does not slow decode**,
+which proves **launch overhead is negligible — decode is fully GPU-bound.** The ~9.5 GB/token of
+weight reads plus the indexer/attention compute dominate; the hundreds of per-token kernel
+launches are entirely hidden behind that GPU work. With nothing to recover, CUDA graphs cannot
+help. (ExecUpdate also reinstantiates ~every other token because the decode tape topology cycles,
+but even that overhead is hidden — graphs-on is not slower.)
+
+**Decision:** keep the implementation — it is correct, bit-exact, and strictly opt-in
+(`DS4_CUDA_GRAPH`, default OFF), so it changes nothing by default. It becomes potentially useful
+later: once Phase 2 (KV quantization) cuts per-token GPU time, launch overhead becomes a larger
+relative fraction and graphs may then pay off. `-default-stream per-thread` is benign and kept.
+
+**Conclusion / pivot:** the real lever for both "use less memory" and the 600–800K-context goal
+is **KV-cache quantization** — the live GPU KV cache is F32 today (3.1 GB at 128K, growing to
+~15–20 GB toward 800K). FP8 (a path already half-present) or TurboQuant (~3-bit on the 512-dim
+compressed rows) cuts that several-fold and also reduces the indexer/attention KV bandwidth that
+dominates *long-context* decode. That is Phase 2.
