@@ -216,6 +216,9 @@ static uint64_t g_cuda_tmp_bytes;
 static void          *g_comp_f32_expand_ptr;
 static uint64_t       g_comp_f32_expand_bytes;
 static ds4_gpu_tensor g_comp_f32_expand_view;
+/* Device identity index array [0..511] for decode gather-of-selected. */
+static int32_t       *g_identity_topk_ptr;
+static ds4_gpu_tensor g_identity_topk_view;
 
 /* CUDA Graph capture state for the single-token decode path. The decode "tape"
  * is a fixed sequence of kernel launches; capturing it once and replaying it via
@@ -2333,6 +2336,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_comp_f32_expand_ptr = NULL;
         g_comp_f32_expand_bytes = 0;
     }
+    if (g_identity_topk_ptr) {
+        (void)cudaFree(g_identity_topk_ptr);
+        g_identity_topk_ptr = NULL;
+    }
     if (g_decode_graph_exec) {
         (void)cudaGraphExecDestroy(g_decode_graph_exec);
         g_decode_graph_exec = NULL;
@@ -3696,6 +3703,27 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
 __global__ static void f16_to_f32_kernel(float *out, const __half *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __half2float(x[i]);
+}
+
+/* Gather the topk-selected F16 comp rows into a compact F32 buffer (decode
+ * gather-of-selected: dequantize only the rows attention will read instead of
+ * all n_comp). out[row,*] = f32(comp[topk[row],*]); out-of-range indices -> 0. */
+__global__ static void gather_comp_f16_to_f32_kernel(float *out, const __half *comp,
+                                                     const int32_t *topk, uint32_t n_sel,
+                                                     uint32_t n_comp, uint32_t head_dim) {
+    const uint64_t total = (uint64_t)n_sel * head_dim;
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const uint32_t row = (uint32_t)(i / head_dim);
+    const uint32_t d = (uint32_t)(i % head_dim);
+    const int32_t src = topk[row];
+    out[i] = (src >= 0 && (uint32_t)src < n_comp)
+        ? __half2float(comp[(uint64_t)src * head_dim + d]) : 0.0f;
+}
+
+__global__ static void iota_i32_kernel(int32_t *out, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (int32_t)i;
 }
 
 /* Narrowing copy for the F16 compressed-KV cache staging (write side): read `count`
@@ -8852,6 +8880,54 @@ static const ds4_gpu_tensor *cuda_expand_comp_f16_to_f32(const ds4_gpu_tensor *c
     return &g_comp_f32_expand_view;
 }
 
+/* Decode gather-of-selected: dequantize only the n_sel topk-selected rows of an
+ * F16 comp cache into the reused F32 scratch, so attention reads ~top_k rows
+ * instead of all n_comp (the long-context decode win). Pair with cuda_identity_topk. */
+static const ds4_gpu_tensor *cuda_gather_comp_f16_to_f32(const ds4_gpu_tensor *comp_f16,
+                                                         const ds4_gpu_tensor *topk,
+                                                         uint32_t n_sel, uint32_t n_comp,
+                                                         uint32_t head_dim) {
+    if (!comp_f16 || !topk || n_sel == 0u || head_dim == 0u) return NULL;
+    const uint64_t count = (uint64_t)n_sel * head_dim;
+    const uint64_t bytes = count * sizeof(float);
+    if (g_comp_f32_expand_bytes < bytes) {
+        if (g_comp_f32_expand_ptr) (void)cudaFree(g_comp_f32_expand_ptr);
+        g_comp_f32_expand_ptr = NULL;
+        g_comp_f32_expand_bytes = 0;
+        if (cudaMalloc(&g_comp_f32_expand_ptr, (size_t)bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_comp_f32_expand_ptr = NULL;
+            return NULL;
+        }
+        g_comp_f32_expand_bytes = bytes;
+    }
+    gather_comp_f16_to_f32_kernel<<<(unsigned)((count + 255u) / 256u), 256>>>(
+            (float *)g_comp_f32_expand_ptr, (const __half *)comp_f16->ptr,
+            (const int32_t *)topk->ptr, n_sel, n_comp, head_dim);
+    if (!cuda_ok(cudaGetLastError(), "comp f16 gather")) return NULL;
+    g_comp_f32_expand_view.ptr = g_comp_f32_expand_ptr;
+    g_comp_f32_expand_view.bytes = g_comp_f32_expand_bytes;
+    g_comp_f32_expand_view.owner = 0;
+    return &g_comp_f32_expand_view;
+}
+
+/* Identity index buffer [0,1,...] used as the topk after gather-of-selected. */
+static const ds4_gpu_tensor *cuda_identity_topk(void) {
+    if (!g_identity_topk_ptr) {
+        if (cudaMalloc(&g_identity_topk_ptr, 512u * sizeof(int32_t)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_identity_topk_ptr = NULL;
+            return NULL;
+        }
+        iota_i32_kernel<<<1, 512>>>(g_identity_topk_ptr, 512u);
+        if (!cuda_ok(cudaGetLastError(), "identity topk fill")) return NULL;
+    }
+    g_identity_topk_view.ptr = g_identity_topk_ptr;
+    g_identity_topk_view.bytes = 512u * sizeof(int32_t);
+    g_identity_topk_view.owner = 0;
+    return &g_identity_topk_view;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -9200,7 +9276,25 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (comp_kv_f16) {
-        if (comp_kv && n_comp) {
+        if (comp_kv && n_comp && topk && n_tokens == 1u && ratio != 0u) {
+            /* Decode: dequantize only the topk-selected rows (gather-of-selected),
+             * then read them via an identity index -- O(top_k) instead of O(n_comp),
+             * which keeps long-context decode cheap. */
+            uint32_t visible = (pos0 + 1u) / ratio;
+            if (visible > n_comp) visible = n_comp;
+            uint32_t sel = top_k < visible ? top_k : visible;
+            if (sel > 512u) sel = 512u;
+            if (sel) {
+                const ds4_gpu_tensor *gthr =
+                    cuda_gather_comp_f16_to_f32(comp_kv, topk, sel, n_comp, head_dim);
+                const ds4_gpu_tensor *ident = cuda_identity_topk();
+                if (!gthr || !ident) return 0;
+                comp_kv = gthr;
+                topk = ident;
+                n_comp = sel;
+            }
+        } else if (comp_kv && n_comp) {
+            /* Prefill / fallback: dequantize all visible comp rows. */
             const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
             if (!cef) return 0;
             comp_kv = cef;
