@@ -73,6 +73,26 @@ scalar kernels alone let us validate F16 correctness at small context first.
 - **Phase 2b — FP8 / TurboQuant (~3-bit)** on the 512-dim compressed rows: add parallel per-row
   scale buffers + dequant in the read kernels. Keep RoPE-key and 128-dim indexer higher precision.
 
-## Status
-Phase 1 (CUDA graphs) done (neutral, opt-in). This plan is scoped and ready to execute; repo is
-clean at commit fa1b6b6. The one helper was prototyped and reverted to keep the tree clean.
+## Status — Phase 2a LANDED (commit 08ad8e5)
+
+Compressed attention KV is now F16 on CUDA, via **expand-on-read** (lower risk than the 7-kernel
+in-kernel __half rewrite above): the 5 extern attention entry points dequantize the F16 comp rows
+to a reused F32 scratch (`cuda_expand_comp_f16_to_f32` + `f16_to_f32_kernel`) and run the existing
+F32 kernels unchanged; write side uses `ds4_gpu_tensor_copy_f32_to_f16`. Validated:
+- Correctness: teacher-forced perplexity nll 317.843968 (F32) → 317.842979 (F16), ~3e-6 relative
+  (pure F16 rounding). Near-lossless.
+- Memory: ctx-buffers 432 → 410 MiB at ctx 4096 = exactly the ratio-4 comp cache halving
+  (1026 rows × 512 × 2 bytes × 21 layers); scales to ~4.3 GB saved at 800K.
+- Speed: ~neutral at normal context (13.36 → 13.22 tok/s @2048; 12.90 @8192). Expand overhead
+  grows at extreme length.
+
+### Remaining follow-ons (in priority order)
+1. **gather-of-selected** expand (indexed layers): dequantize only the top-k selected rows + raw
+   window instead of all n_comp — removes the long-context expand overhead so 800K decode stays
+   fast. (Sequential ratio-128 layers can expand [0,n_comp) as today.)
+2. **Indexer KV (128-dim) → F16**: the long-context indexer-scoring bandwidth hotspot; the WMMA
+   indexer kernels already `__float2half` internally.
+3. **Raw KV → F16**: already F16-rounded (lossless).
+4. **In-kernel __half comp reads** (the templating plan above): recovers attention read bandwidth
+   and removes the expand pass entirely.
+5. **Phase 2b — FP8 / TurboQuant ~3-bit** on the 512-dim compressed rows (parallel scale buffers).
