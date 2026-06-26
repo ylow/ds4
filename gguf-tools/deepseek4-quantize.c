@@ -1862,6 +1862,17 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
                                          out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix,
                                          tmpl, p->template_requant);
+    if (out_ctx->tensors[idx].type != tmpl->tensors[idx].type) {
+        printf("type_change: %s -> %s\n",
+               ds4q_type_name(tmpl->tensors[idx].type),
+               ds4q_type_name(out_ctx->tensors[idx].type));
+        printf("generated_bytes: %zu  (template_bytes: %zu)\n",
+               generated.size, tmpl->tensors[idx].size);
+        printf("generated_fnv1a64: %016" PRIx64 "\n",
+               fnv1a64_bytes(generated.data, generated.size));
+        free(generated.data);
+        return;
+    }
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
