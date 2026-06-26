@@ -15842,6 +15842,31 @@ static bool metal_graph_encode_decode_layer(
         !metal_graph_directional_steering_attn_enabled(g) &&
         !metal_graph_use_reference_attn_out_hc();
     if (ok && fuse_attn_out_hc) {
+        if (layer->attn_output_a->type == DS4_TENSOR_Q4_K) {
+            ok = ds4_gpu_attention_output_low_q4k_tensor(g->attn_low,
+                                                          model->map,
+                                                          model->size,
+                                                          layer->attn_output_a->abs_offset,
+                                                          group_dim,
+                                                          rank,
+                                                          n_groups,
+                                                          g->heads,
+                                                          1) != 0;
+            if (ok) {
+                ok = ds4_gpu_matmul_q4k_hc_expand_tensor(g->after_attn_hc,
+                                                         g->attn_out,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->attn_output_b->abs_offset,
+                                                         (uint64_t)n_groups * rank,
+                                                         DS4_N_EMBD,
+                                                         g->attn_low,
+                                                         g->cur_hc,
+                                                         g->hc_split,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC) != 0;
+            }
+        } else {
         ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
                                                       model->map,
                                                       model->size,
@@ -15864,7 +15889,19 @@ static bool metal_graph_encode_decode_layer(
                                                         DS4_N_EMBD,
                                                         DS4_N_HC) != 0;
         }
+        }
     } else if (ok) {
+        if (layer->attn_output_a->type == DS4_TENSOR_Q4_K) {
+            ok = ds4_gpu_attention_output_q4k_batch_tensor(g->attn_out,
+                                                           g->attn_low,
+                                                           model->map,
+                                                           model->size,
+                                                           layer->attn_output_a->abs_offset,
+                                                           layer->attn_output_b->abs_offset,
+                                                           group_dim, rank,
+                                                           n_groups, DS4_N_EMBD,
+                                                           g->heads, 1) != 0;
+        } else {
         ok = ds4_gpu_attention_output_q8_batch_tensor(g->attn_out,
                                                         g->attn_low,
                                                         g->batch_group_tmp,
@@ -15876,6 +15913,7 @@ static bool metal_graph_encode_decode_layer(
                                                         group_dim, rank,
                                                         n_groups, DS4_N_EMBD,
                                                         g->heads, 1) != 0;
+        }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
     if (ok) {
@@ -19134,7 +19172,8 @@ static bool metal_graph_encode_layer_attention_batch(
     bool attn_out_f16 = false;
     if (ok &&
         !attn_out_debug &&
-        !metal_graph_directional_steering_attn_enabled(g)) {
+        !metal_graph_directional_steering_attn_enabled(g) &&
+        layer->attn_output_a->type != DS4_TENSOR_Q4_K) {
         attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
                                                                     g->batch_attn_low,
                                                                     model->map,
@@ -19150,6 +19189,20 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     if (!attn_out_f16) {
         if (ok) {
+            if (layer->attn_output_a->type == DS4_TENSOR_Q4_K) {
+                ok = ds4_gpu_attention_output_q4k_batch_tensor(g->batch_attn_out,
+                                                               g->batch_attn_low,
+                                                               model->map,
+                                                               model->size,
+                                                               layer->attn_output_a->abs_offset,
+                                                               layer->attn_output_b->abs_offset,
+                                                               group_dim,
+                                                               rank,
+                                                               n_groups,
+                                                               DS4_N_EMBD,
+                                                               g->batch_heads,
+                                                               n_tokens) != 0;
+            } else {
             ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
                                                           g->batch_attn_low,
                                                           g->batch_group_tmp,
@@ -19164,6 +19217,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           DS4_N_EMBD,
                                                           g->batch_heads,
                                                           n_tokens) != 0;
+            }
         }
         if (ok) {
             metal_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
