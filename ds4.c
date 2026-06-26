@@ -13647,8 +13647,10 @@ static DS4_MAYBE_UNUSED uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
 }
 
 /* Storage dtype the attention entry points use for the compressed-attention KV cache:
- * 0 = F32, 1 = F16, 2 = FP8-split (NoPE E4M3 byte + per-group exponent, RoPE F16).
- * FP8 takes precedence over F16 when both macros are on (CUDA). */
+ * 0 = F32, 1 = F16, 2 = FP8-split (NoPE E4M3 byte + per-group exponent, RoPE F16),
+ * 3 = FP4-split (Hadamard-FP4: NoPE E2M1 nibble-packed + per-group exponent, RoPE F16).
+ * FP8 takes precedence over F16 when both macros are on (CUDA).
+ * FP4 takes precedence over FP8 when both are on. */
 static uint32_t metal_graph_attn_comp_cache_dtype(void) {
 #if DS4_GPU_ATTN_COMP_CACHE_FP4
     return 3u;
@@ -13670,6 +13672,51 @@ static uint32_t metal_graph_index_comp_cache_is_f16(void) {
     return DS4_GPU_INDEX_COMP_CACHE_F16 ? 1u : 0u;
 }
 
+static DS4_MAYBE_UNUSED void metal_graph_fp4_selfcheck(
+        ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows) {
+    if (!getenv("DS4_FP4_SELFCHECK") || rows == 0) return;
+    const uint32_t n_nope = DS4_N_HEAD_DIM - DS4_N_ROT;
+    const size_t   half   = n_nope / 2u;
+    uint8_t *gb = xmalloc((size_t)rows * half);
+    int8_t  *xe = xmalloc((size_t)rows * 8u);
+    float   *st = xmalloc((size_t)rows * DS4_N_HEAD_DIM * sizeof(float));
+    if (ds4_gpu_tensor_read(g->layer_attn_comp_cache[il], (uint64_t)first_row * half, gb,
+                            (size_t)rows * half) == 0 ||
+        ds4_gpu_tensor_read(g->layer_attn_comp_scale[il], (uint64_t)first_row * 8u, xe,
+                            (size_t)rows * 8u) == 0 ||
+        ds4_gpu_tensor_read(g->attn_comp_stage, 0, st,
+                            (size_t)rows * DS4_N_HEAD_DIM * sizeof(float)) == 0) {
+        free(gb); free(xe); free(st); return;
+    }
+    uint64_t byte_mismatch = 0, val_mismatch = 0;
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t off = 0; off < n_nope; off += 64u) {
+            float grp[64];
+            for (uint32_t l = 0; l < 64u; l++) grp[l] = st[(size_t)r * DS4_N_HEAD_DIM + off + l];
+            dsv4_hadamard64_inplace_cpu(grp);
+            float amax = 7.052966104933725e-38f;
+            for (uint32_t l = 0; l < 64u; l++) { float a = fabsf(grp[l]); if (a > amax) amax = a; }
+            int e2; const float fr = frexpf(amax / 6.0f, &e2);
+            const int k = (fr == 0.5f) ? (e2 - 1) : e2;
+            const float scale = ldexpf(1.0f, k);
+            if ((int)xe[(size_t)r * 8u + (off >> 6)] != k) byte_mismatch++;
+            for (uint32_t l = 0; l < 64u; l++) {
+                float v = grp[l] / scale; if (v > 6.0f) v = 6.0f; if (v < -6.0f) v = -6.0f;
+                const uint8_t want = dsv4_e2m1fn_index_cpu(v);
+                const uint8_t byte = gb[(size_t)r * half + (off + l) / 2u];
+                const uint8_t got  = ((off + l) & 1u) ? (byte >> 4) : (byte & 0xfu);
+                if (got != want) byte_mismatch++;
+                const float dgot  = dsv4_e2m1fn_decode_nibble_cpu(got)  * scale;
+                const float dwant = dsv4_e2m1fn_decode_nibble_cpu(want) * scale;
+                if (dgot != dwant) val_mismatch++;
+            }
+        }
+    }
+    fprintf(stderr, "ds4: FP4 selfcheck layer %u rows %u byte_mismatch=%llu val_mismatch=%llu\n",
+            il, rows, (unsigned long long)byte_mismatch, (unsigned long long)val_mismatch);
+    free(gb); free(xe); free(st);
+}
+
 static bool metal_graph_store_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -13685,14 +13732,15 @@ static bool metal_graph_store_attn_comp_stage(
 
 #if DS4_GPU_ATTN_COMP_CACHE_FP4
     if (!g->layer_attn_comp_rope[il] || !g->layer_attn_comp_scale[il]) return false;
-    return ds4_gpu_tensor_quantize_f32_to_fp4split(g->layer_attn_comp_cache[il],
-                                                   g->layer_attn_comp_scale[il],
-                                                   g->layer_attn_comp_rope[il],
-                                                   first_row,
-                                                   g->attn_comp_stage,
-                                                   rows,
-                                                   DS4_N_HEAD_DIM,
-                                                   DS4_N_ROT) != 0;
+    {
+        const bool ok = ds4_gpu_tensor_quantize_f32_to_fp4split(g->layer_attn_comp_cache[il],
+                                                                g->layer_attn_comp_scale[il],
+                                                                g->layer_attn_comp_rope[il],
+                                                                first_row, g->attn_comp_stage,
+                                                                rows, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+        if (ok) metal_graph_fp4_selfcheck(g, il, first_row, rows);
+        return ok;
+    }
 #elif DS4_GPU_ATTN_COMP_CACHE_FP8
     /* FP8-split: quantize the staged F32 rows into the E4M3/exponent/F16-RoPE cache.
      * The quantize entry point is CUDA-only, so this branch is compiled only when the
@@ -24256,8 +24304,10 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_fp4split(
                 erow[off >> 6] = (int8_t)k;
                 for (uint32_t l = 0; l < 64u; l += 2u) {
                     float v0 = grp[l] / scale, v1 = grp[l + 1] / scale;
-                    if (v0 > 6.0f) v0 = 6.0f; if (v0 < -6.0f) v0 = -6.0f;
-                    if (v1 > 6.0f) v1 = 6.0f; if (v1 < -6.0f) v1 = -6.0f;
+                    if (v0 > 6.0f) v0 = 6.0f;
+                    if (v0 < -6.0f) v0 = -6.0f;
+                    if (v1 > 6.0f) v1 = 6.0f;
+                    if (v1 < -6.0f) v1 = -6.0f;
                     nrow[(off + l) / 2u] =
                         (uint8_t)(dsv4_e2m1fn_index_cpu(v0) | (dsv4_e2m1fn_index_cpu(v1) << 4));
                 }
