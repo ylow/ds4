@@ -210,9 +210,33 @@ Update `ds4-optimization-findings` memory + the Status section below afterward.
   so the **near-term win is MEMORY**, not tok/s at 4K–25K. In-kernel FP4 reads (recover read
   bandwidth, drop the expand pass — the indexer pattern) remain a later follow-on.
 
-## Status — PLANNED
+## Status — LANDED (NF4 codec; +0.367% nll, within the 0.5% gate)
 
-Design approved 2026-06-26. Implementation not yet started. Follow-ons after this lands
-(unchanged priority): in-kernel `__half`/FP8/FP4 reads for the *attention* comp cache
-(recover read bandwidth, drop the expand pass); raw-KV → F16 (lossless, low value); then
-true sub-byte **3-bit** on this same Hadamard-split layout if the memory lever needs more.
+Implemented 2026-06-26 in five commits: `bc4ac73` read plumbing (inert), `dbeb484`
+write/buffers/save-load/trace (inert), `a2ba661` value self-check (env-gated), then the
+flip `d0c8b30`.
+
+**Codec pivot — E2M1 → NF4.** The design above specifies the model's own **E2M1** FP4 on
+the Hadamard-rotated NoPE dims. On flip-on, E2M1 was byte-exact (self-check clean) but
+**+2.13%** nll (324.62 @4096) — 4× the 0.5% gate. Root cause: E2M1's exponential level
+spacing `{0,±.5,±1,±1.5,±2,±3,±4,±6}` is mismatched to the **~Gaussian** post-Hadamard
+distribution. Swapped the FP4-comp codec to **NF4** (NormalFloat4): the 16 unit-Gaussian
+**quantile** levels on [-1,1], a full 4-bit nibble (no sign bit), max level 1.0. Same
+per-64 power-of-2 int8 scale, same 360 B/row layout, same row split — only the value table
++ nearest-level search changed (`nf4_level_dev/_cpu`, `nf4_index_dev/_cpu`,
+`nf4_decode_nibble_dev/_cpu`). The indexer keeps its own E2M1; the now-dead FP4-comp E2M1
+device helpers are retained `DS4_CUDA_UNUSED`.
+
+**Result.** Value self-check **byte-perfect** across all 41 layers (byte/val_mismatch=0
+over 1384 checks) ⇒ the drift is intended NF4 loss, not a bug. Teacher-forced perplexity
+**nll=319.009406860 @4096** (avg 1.2461, ppl 3.462→3.477) = **+0.367%** vs the FP8 build
+317.842979423 — **within the ≤319.4 (0.5%) gate** (NF4 cut E2M1's +2.13% by ~6×). Context
+buffers **396.21 → 391.46 MiB @4096** (comp cache 12.0 → ~7.25 MiB), 547.52 MiB @16384;
+linear in ctx → multi-GB toward 600–800K. Stable at ctx 16384 (no NaN, avg_nll 1.246).
+
+**Follow-ons** (unchanged priority): chase the last range bit with a per-group **F16
+absmax** scale instead of power-of-2 (NF4's [-1,1] is currently under-filled by ~0.3 bit
+when a group's absmax sits just above a power of 2); in-kernel FP4 reads for the *attention*
+comp cache (recover read bandwidth, drop the expand pass); raw-KV → F16 (lossless, low
+value); then true sub-byte **3-bit** on this same Hadamard-split layout if the memory lever
+needs more.
