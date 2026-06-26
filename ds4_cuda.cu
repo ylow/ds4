@@ -4562,6 +4562,99 @@ __device__ static float dsv4_e2m1fn_dequant_dev(float x) {
     return sign * dsv4_e2m1fn_value_dev(best);
 }
 
+/* Decode a stored E2M1FN nibble back to float: bit3 = sign, bits0..2 = magnitude
+ * index into dsv4_e2m1fn_value_dev.  Sibling of dsv4_e4m3fn_decode_byte_dev. */
+__device__ static float dsv4_e2m1fn_decode_nibble_dev(uint8_t nib) {
+    float mag = dsv4_e2m1fn_value_dev((int)(nib & 0x7u));
+    return (nib & 0x8u) ? -mag : mag;
+}
+
+/* In-place 64-wide normalized Walsh-Hadamard on shared vals[0..63] across exactly 64
+ * threads (tid 0..63).  Normalized by 1/sqrt(64)=0.125, so (H64*0.125)^2 = I: the SAME
+ * call rotates on write and un-rotates on read.  Butterfly stride order matches
+ * dsv4_hadamard64_inplace_cpu bit-for-bit (plain add/sub, no FMA).  Ends syncthreaded. */
+__device__ static void hadamard64_shared(float *vals, uint32_t tid) {
+    for (uint32_t stride = 1u; stride < 64u; stride <<= 1u) {
+        if ((tid & stride) == 0u) {
+            uint32_t base = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));
+            float a = vals[base];
+            float b = vals[base + stride];
+            vals[base]          = a + b;
+            vals[base + stride] = a - b;
+        }
+        __syncthreads();
+    }
+    vals[tid] *= 0.125f;
+    __syncthreads();
+}
+
+/* Expand all n_comp Hadamard-FP4 rows to F32.  One block per row, 64 threads.  NoPE: per
+ * 64-group g, unpack nibble -> dsv4_e2m1fn_decode_nibble_dev * 2^exp[g] (rotated domain),
+ * then hadamard64_shared un-rotates into the original basis.  RoPE tail: F16 -> F32.
+ * Writes the reused F32 scratch so the trusted F32 attention kernels are byte-identical. */
+__global__ static void expand_comp_fp4_to_f32_kernel(
+        float *out, const uint8_t *nope, const int8_t *expo, const __half *rope,
+        uint32_t n_comp, uint32_t head_dim, uint32_t n_rot) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;            /* 0..63 */
+    if (row >= n_comp) return;
+    const uint32_t n_nope = head_dim - n_rot;    /* 448 */
+    const uint32_t n_grp  = n_nope / 64u;        /* 7   */
+    const uint8_t *nr = nope + (uint64_t)row * (n_nope / 2u);
+    const int8_t  *er = expo + (uint64_t)row * 8u;
+    const __half  *rr = rope + (uint64_t)row * n_rot;
+    float *orow = out + (uint64_t)row * head_dim;
+    __shared__ float vals[64];
+    for (uint32_t g = 0; g < n_grp; g++) {
+        const uint8_t byte = nr[g * 32u + (tid >> 1)];
+        const uint8_t nib  = (tid & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
+        vals[tid] = dsv4_e2m1fn_decode_nibble_dev(nib) * exp2f((float)er[g]);
+        __syncthreads();
+        hadamard64_shared(vals, tid);
+        orow[g * 64u + tid] = vals[tid];
+        __syncthreads();
+    }
+    for (uint32_t d = tid; d < n_rot; d += 64u)
+        orow[n_nope + d] = __half2float(rr[d]);
+}
+
+/* Gather-of-selected (decode path): dequantize only the n_sel topk rows of a Hadamard-FP4
+ * cache into the reused F32 scratch; out-of-range indices -> zeroed row (cf.
+ * gather_comp_fp8_to_f32_kernel).  src is uniform across the block, so the invalid-row
+ * early return cannot deadlock hadamard64_shared. */
+__global__ static void gather_comp_fp4_to_f32_kernel(
+        float *out, const uint8_t *nope, const int8_t *expo, const __half *rope,
+        const int32_t *topk, uint32_t n_sel, uint32_t n_comp,
+        uint32_t head_dim, uint32_t n_rot) {
+    const uint32_t orow = blockIdx.x;
+    const uint32_t tid  = threadIdx.x;
+    if (orow >= n_sel) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_grp  = n_nope / 64u;
+    float *od = out + (uint64_t)orow * head_dim;
+    const int32_t src = topk[orow];
+    if (src < 0 || (uint32_t)src >= n_comp) {
+        for (uint32_t d = tid; d < head_dim; d += 64u) od[d] = 0.0f;
+        return;
+    }
+    const uint32_t row = (uint32_t)src;
+    const uint8_t *nr = nope + (uint64_t)row * (n_nope / 2u);
+    const int8_t  *er = expo + (uint64_t)row * 8u;
+    const __half  *rr = rope + (uint64_t)row * n_rot;
+    __shared__ float vals[64];
+    for (uint32_t g = 0; g < n_grp; g++) {
+        const uint8_t byte = nr[g * 32u + (tid >> 1)];
+        const uint8_t nib  = (tid & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
+        vals[tid] = dsv4_e2m1fn_decode_nibble_dev(nib) * exp2f((float)er[g]);
+        __syncthreads();
+        hadamard64_shared(vals, tid);
+        od[g * 64u + tid] = vals[tid];
+        __syncthreads();
+    }
+    for (uint32_t d = tid; d < n_rot; d += 64u)
+        od[n_nope + d] = __half2float(rr[d]);
+}
+
 __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
     const char *p = (const char *)base + offset;
     if (type == 1u) return __half2float(((const __half *)p)[idx]);
@@ -9135,6 +9228,63 @@ static const ds4_gpu_tensor *cuda_gather_comp_fp8_to_f32(const ds4_gpu_tensor *n
     return &g_comp_f32_expand_view;
 }
 
+/* Hadamard-FP4 expand-all (prefill): mirrors cuda_expand_comp_fp8_to_f32 but one block/row. */
+static const ds4_gpu_tensor *cuda_expand_comp_fp4_to_f32(const ds4_gpu_tensor *nope,
+        const ds4_gpu_tensor *expo, const ds4_gpu_tensor *rope,
+        uint32_t n_comp, uint32_t head_dim, uint32_t n_rot) {
+    if (!nope || !expo || !rope || n_comp == 0u || head_dim == 0u) return NULL;
+    const uint64_t count = (uint64_t)n_comp * head_dim;
+    const uint64_t bytes = count * sizeof(float);
+    if (g_comp_f32_expand_bytes < bytes) {
+        if (g_comp_f32_expand_ptr) (void)cudaFree(g_comp_f32_expand_ptr);
+        g_comp_f32_expand_ptr = NULL;
+        g_comp_f32_expand_bytes = 0;
+        if (cudaMalloc(&g_comp_f32_expand_ptr, (size_t)bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_comp_f32_expand_ptr = NULL;
+            return NULL;
+        }
+        g_comp_f32_expand_bytes = bytes;
+    }
+    expand_comp_fp4_to_f32_kernel<<<n_comp, 64>>>(
+            (float *)g_comp_f32_expand_ptr, (const uint8_t *)nope->ptr,
+            (const int8_t *)expo->ptr, (const __half *)rope->ptr, n_comp, head_dim, n_rot);
+    if (!cuda_ok(cudaGetLastError(), "comp fp4->f32 expand")) return NULL;
+    g_comp_f32_expand_view.ptr = g_comp_f32_expand_ptr;
+    g_comp_f32_expand_view.bytes = g_comp_f32_expand_bytes;
+    g_comp_f32_expand_view.owner = 0;
+    return &g_comp_f32_expand_view;
+}
+
+/* Hadamard-FP4 gather-of-selected (decode): mirrors cuda_gather_comp_fp8_to_f32. */
+static const ds4_gpu_tensor *cuda_gather_comp_fp4_to_f32(const ds4_gpu_tensor *nope,
+        const ds4_gpu_tensor *expo, const ds4_gpu_tensor *rope, const ds4_gpu_tensor *topk,
+        uint32_t n_sel, uint32_t n_comp, uint32_t head_dim, uint32_t n_rot) {
+    if (!nope || !expo || !rope || !topk || n_sel == 0u || head_dim == 0u) return NULL;
+    const uint64_t count = (uint64_t)n_sel * head_dim;
+    const uint64_t bytes = count * sizeof(float);
+    if (g_comp_f32_expand_bytes < bytes) {
+        if (g_comp_f32_expand_ptr) (void)cudaFree(g_comp_f32_expand_ptr);
+        g_comp_f32_expand_ptr = NULL;
+        g_comp_f32_expand_bytes = 0;
+        if (cudaMalloc(&g_comp_f32_expand_ptr, (size_t)bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_comp_f32_expand_ptr = NULL;
+            return NULL;
+        }
+        g_comp_f32_expand_bytes = bytes;
+    }
+    gather_comp_fp4_to_f32_kernel<<<n_sel, 64>>>(
+            (float *)g_comp_f32_expand_ptr, (const uint8_t *)nope->ptr,
+            (const int8_t *)expo->ptr, (const __half *)rope->ptr,
+            (const int32_t *)topk->ptr, n_sel, n_comp, head_dim, n_rot);
+    if (!cuda_ok(cudaGetLastError(), "comp fp4 gather")) return NULL;
+    g_comp_f32_expand_view.ptr = g_comp_f32_expand_ptr;
+    g_comp_f32_expand_view.bytes = g_comp_f32_expand_bytes;
+    g_comp_f32_expand_view.owner = 0;
+    return &g_comp_f32_expand_view;
+}
+
 /* Identity index buffer [0,1,...] used as the topk after gather-of-selected. */
 static const ds4_gpu_tensor *cuda_identity_topk(void) {
     if (!g_identity_topk_ptr) {
@@ -9183,6 +9333,14 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     } else if (comp_kv_dtype == 1u) {
         if (comp_kv && n_comp) {
             const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_dtype = 0u;
+    } else if (comp_kv_dtype == 3u) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_fp4_to_f32(
+                    comp_kv, comp_scale, comp_rope, n_comp, head_dim, comp_n_rot);
             if (!cef) return 0;
             comp_kv = cef;
         }
@@ -9493,6 +9651,14 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
             comp_kv = cef;
         }
         comp_kv_dtype = 0u;
+    } else if (comp_kv_dtype == 3u) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_fp4_to_f32(
+                    comp_kv, comp_scale, comp_rope, n_comp, head_dim, comp_n_rot);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_dtype = 0u;
     }
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, 0u, comp_mask, use_comp_mask,
@@ -9526,6 +9692,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                head_dim) {
     if (comp_kv_dtype) {
         const int is_fp8 = (comp_kv_dtype == 2u);
+        const int is_fp4 = (comp_kv_dtype == 3u);
         if (comp_kv && n_comp && topk && n_tokens == 1u && ratio != 0u) {
             /* Decode: dequantize only the topk-selected rows (gather-of-selected),
              * then read them via an identity index -- O(top_k) instead of O(n_comp),
@@ -9535,7 +9702,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             uint32_t sel = top_k < visible ? top_k : visible;
             if (sel > 512u) sel = 512u;
             if (sel) {
-                const ds4_gpu_tensor *gthr = is_fp8
+                const ds4_gpu_tensor *gthr = is_fp4
+                    ? cuda_gather_comp_fp4_to_f32(comp_kv, comp_scale, comp_rope, topk, sel, n_comp, head_dim, comp_n_rot)
+                    : is_fp8
                     ? cuda_gather_comp_fp8_to_f32(comp_kv, comp_scale, comp_rope, topk, sel, n_comp, head_dim, comp_n_rot)
                     : cuda_gather_comp_f16_to_f32(comp_kv, topk, sel, n_comp, head_dim);
                 const ds4_gpu_tensor *ident = cuda_identity_topk();
@@ -9546,7 +9715,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             }
         } else if (comp_kv && n_comp) {
             /* Prefill / fallback: dequantize all visible comp rows. */
-            const ds4_gpu_tensor *cef = is_fp8
+            const ds4_gpu_tensor *cef = is_fp4
+                ? cuda_expand_comp_fp4_to_f32(comp_kv, comp_scale, comp_rope, n_comp, head_dim, comp_n_rot)
+                : is_fp8
                 ? cuda_expand_comp_fp8_to_f32(comp_kv, comp_scale, comp_rope, n_comp, head_dim, comp_n_rot)
                 : cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
             if (!cef) return 0;
@@ -9822,6 +9993,14 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
             comp_kv = cef;
         }
         comp_kv_dtype = 0u;
+    } else if (comp_kv_dtype == 3u) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_fp4_to_f32(
+                    comp_kv, comp_scale, comp_rope, n_comp, head_dim, comp_n_rot);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_dtype = 0u;
     }
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
@@ -9858,6 +10037,14 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
     } else if (comp_kv_dtype == 1u) {
         if (comp_kv && n_comp) {
             const ds4_gpu_tensor *cef = cuda_expand_comp_f16_to_f32(comp_kv, n_comp, head_dim);
+            if (!cef) return 0;
+            comp_kv = cef;
+        }
+        comp_kv_dtype = 0u;
+    } else if (comp_kv_dtype == 3u) {
+        if (comp_kv && n_comp) {
+            const ds4_gpu_tensor *cef = cuda_expand_comp_fp4_to_f32(
+                    comp_kv, comp_scale, comp_rope, n_comp, head_dim, comp_n_rot);
             if (!cef) return 0;
             comp_kv = cef;
         }
