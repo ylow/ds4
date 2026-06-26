@@ -3700,7 +3700,7 @@ static void weights_validate_layout(
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_q8_0_or_q4_k_layout(l->attn_q_b, 2, DS4_N_LORA_Q, q_dim, 0);
         tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
@@ -3770,7 +3770,7 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
     tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
     tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+    tensor_expect_q8_0_or_q4_k_layout(l->attn_q_b, 2, DS4_N_LORA_Q, q_dim, 0);
     tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
     tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
     tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
@@ -15396,10 +15396,16 @@ static bool metal_graph_encode_decode_layer(
     if (qkv_rms_fused && ok) {
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
-                                              layer->attn_q_b->abs_offset,
-                                              q_rank, q_dim,
-                                              g->qr_norm, 1) != 0;
+    if (ok) {
+        if (layer->attn_q_b->type == DS4_TENSOR_Q4_K)
+            ok = ds4_gpu_matmul_q4k_tensor(g->q, model->map, model->size,
+                                           layer->attn_q_b->abs_offset, q_rank, q_dim,
+                                           g->qr_norm, 1) != 0;
+        else
+            ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
+                                            layer->attn_q_b->abs_offset, q_rank, q_dim,
+                                            g->qr_norm, 1) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
@@ -16694,9 +16700,11 @@ static bool metal_graph_matmul_q8_0_named_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    (void)module;
-    (void)il;
-    (void)pos0;
+    (void)module; (void)il; (void)pos0;
+    if (w->type == DS4_TENSOR_Q4_K) {
+        return ds4_gpu_matmul_q4k_tensor(out, model->map, model->size,
+                                         w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
+    }
     const bool ok = ds4_gpu_matmul_q8_0_tensor(out,
                                                  model->map,
                                                  model->size,
@@ -17949,7 +17957,7 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_wants("Qraw", il, pos0) ||
         metal_graph_debug_wants("Qnorm", il, pos0);
     bool q_b_f16_out = false;
-    if (ok && !q_path_debug) {
+    if (ok && !q_path_debug && layer->attn_q_b->type != DS4_TENSOR_Q4_K) {
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(g->batch_q,
                                                                      g->batch_q_half,
                                                                      model->map,
