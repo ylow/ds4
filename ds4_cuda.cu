@@ -4655,6 +4655,86 @@ __global__ static void gather_comp_fp4_to_f32_kernel(
         od[n_nope + d] = __half2float(rr[d]);
 }
 
+/* Encode an already-scaled value (|x| clamped to 6) to an E2M1FN nibble: bit3 = sign,
+ * bits0..2 = the magnitude index dsv4_e2m1fn_dequant_dev would pick (same tie-break). */
+__device__ static uint8_t dsv4_e2m1fn_index_dev(float x) {
+    uint8_t sign = (x < 0.0f) ? 0x8u : 0x0u;
+    float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
+    for (int i = 1; i < 8; i++) {
+        float diff = fabsf(ax - dsv4_e2m1fn_value_dev(i));
+        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign | (uint8_t)best;
+}
+
+/* Commit `rows` staged F32 comp rows to the Hadamard-FP4 cache.  One block/row, 64 threads.
+ * Per 64-group: rotate (hadamard64_shared), amax-reduce, frexp-exact k, E2M1 nibble-pack +
+ * int8 exponent; RoPE tail -> F16.  Lossy vs the staged E4M3 value (this is the 4-bit step),
+ * but decode reproduces the codec's own output bit-for-bit (verified by the value self-check). */
+__global__ static void quantize_comp_f32_to_fp4split_kernel(
+        uint8_t *nope_out, int8_t *exp_out, __half *rope_out, uint64_t first_row,
+        const float *src, uint32_t rows, uint32_t head_dim, uint32_t n_rot) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;                 /* 0..63 */
+    if (row >= rows) return;
+    const uint32_t n_nope = head_dim - n_rot;         /* 448 */
+    const uint32_t n_grp  = n_nope / 64u;             /* 7   */
+    const float *xr = src + (uint64_t)row * head_dim;
+    uint8_t *nr = nope_out + ((uint64_t)first_row + row) * (n_nope / 2u);
+    int8_t  *er = exp_out  + ((uint64_t)first_row + row) * 8u;
+    __half  *rr = rope_out + ((uint64_t)first_row + row) * n_rot;
+    __shared__ float   vals[64];
+    __shared__ float   amaxbuf[64];
+    __shared__ uint8_t nibs[64];
+    for (uint32_t g = 0; g < n_grp; g++) {
+        vals[tid] = xr[g * 64u + tid];
+        __syncthreads();
+        hadamard64_shared(vals, tid);                 /* rotate; ends syncthreaded */
+        amaxbuf[tid] = fabsf(vals[tid]);
+        __syncthreads();
+        for (uint32_t s = 32; s > 0; s >>= 1) {
+            if (tid < s) amaxbuf[tid] = fmaxf(amaxbuf[tid], amaxbuf[tid + s]);
+            __syncthreads();
+        }
+        int e2;
+        float fr = frexpf(fmaxf(amaxbuf[0], 7.052966104933725e-38f) / 6.0f, &e2);
+        int k = (fr == 0.5f) ? (e2 - 1) : e2;
+        float scale = exp2f((float)k);
+        nibs[tid] = dsv4_e2m1fn_index_dev(fminf(6.0f, fmaxf(-6.0f, vals[tid] / scale)));
+        __syncthreads();
+        if (tid < 32u)
+            nr[g * 32u + tid] = (uint8_t)(nibs[2u * tid] | (nibs[2u * tid + 1u] << 4));
+        if (tid == 0) er[g] = (int8_t)k;
+        __syncthreads();
+    }
+    for (uint32_t d = tid; d < n_rot; d += 64u)
+        rr[d] = __float2half(xr[n_nope + d]);
+}
+
+/* Quantize `rows` staged F32 comp rows into the Hadamard-FP4 cache at row offset first_row. */
+extern "C" int ds4_gpu_tensor_quantize_f32_to_fp4split(
+        ds4_gpu_tensor *nope, ds4_gpu_tensor *expo, ds4_gpu_tensor *rope, uint64_t first_row,
+        const ds4_gpu_tensor *src_stage, uint32_t rows, uint32_t head_dim, uint32_t n_rot) {
+    if (!nope || !expo || !rope || !src_stage) return 0;
+    if (rows == 0) return 1;
+    if (n_rot >= head_dim) return 0;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint64_t need_nope = ((uint64_t)first_row + rows) * (n_nope / 2u);
+    const uint64_t need_exp  = ((uint64_t)first_row + rows) * 8u;
+    const uint64_t need_rope = ((uint64_t)first_row + rows) * n_rot * sizeof(__half);
+    if (nope->bytes < need_nope || expo->bytes < need_exp || rope->bytes < need_rope ||
+        src_stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
+    quantize_comp_f32_to_fp4split_kernel<<<rows, 64>>>(
+            (uint8_t *)nope->ptr, (int8_t *)expo->ptr, (__half *)rope->ptr, first_row,
+            (const float *)src_stage->ptr, rows, head_dim, n_rot);
+    return cuda_ok(cudaGetLastError(), "quantize f32->fp4split");
+}
+
 __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
     const char *p = (const char *)base + offset;
     if (type == 1u) return __half2float(((const __half *)p)[idx]);

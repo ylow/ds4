@@ -46,6 +46,14 @@ int ds4_gpu_tensor_quantize_f32_to_fp8split(ds4_gpu_tensor *nope, ds4_gpu_tensor
                                             const ds4_gpu_tensor *src_stage, uint32_t rows,
                                             uint32_t head_dim, uint32_t n_rot);
 
+/* Quantize staged F32 compressed-attention rows into the Hadamard-FP4 cache: NoPE dims ->
+ * Hadamard-64 + E2M1 nibble (`nope`, 2/byte) + per-64-group int8 exponent (`expo`), RoPE
+ * tail -> F16 (`rope`).  See DS4_GPU_ATTN_COMP_CACHE_FP4. */
+int ds4_gpu_tensor_quantize_f32_to_fp4split(ds4_gpu_tensor *nope, ds4_gpu_tensor *expo,
+                                            ds4_gpu_tensor *rope, uint64_t first_row,
+                                            const ds4_gpu_tensor *src_stage, uint32_t rows,
+                                            uint32_t head_dim, uint32_t n_rot);
+
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
