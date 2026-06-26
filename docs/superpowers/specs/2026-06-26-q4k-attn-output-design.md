@@ -154,6 +154,12 @@ makes the Q8 path still valid).
 Δnll% (Q4_K vs measured Q8 319.009): **−0.823%**
 Δppl (Q4_K vs measured Q8): **−0.035** (Q4_K is neutral-to-slightly-better, within noise)
 
+**Baseline note (cause of the 317.844→319.009 gap):** the `317.843967992` oracle predates the
+Phase 2c **Hadamard-FP4 (NF4) compressed-attention KV cache**, now on by default
+(`DS4_GPU_ATTN_COMP_CACHE_FP4`, commit d0c8b30), which adds +0.367% nll → `319.009` (the exact
+Phase 2c-recorded value). The correct same-engine baseline is **319.009**; Q4_K-output is
+**316.385** (−0.823%) — no regression. The gap is the already-merged KV feature, not this work.
+
 **Decode throughput (generation tok/s):**
 
 | Model | ctx=4096 | ctx=16384 | prefill @4096 | prefill @16384 |

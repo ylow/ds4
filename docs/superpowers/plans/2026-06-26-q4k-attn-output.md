@@ -797,6 +797,13 @@ Rollback = repoint to the `…AProjQ8…` GGUF. Restart the server if running: `
 Δnll% (Q4_K vs measured Q8 319.009): **−0.823%**
 Δppl (Q4_K vs measured Q8): **−0.035** (Q4_K is slightly better, within noise)
 
+**Baseline note (cause of the 317.844→319.009 gap):** the `317.843967992` oracle predates the
+Phase 2c **Hadamard-FP4 (NF4) compressed-attention KV cache**, which is now enabled by default
+(`DS4_GPU_ATTN_COMP_CACHE_FP4`, commit d0c8b30). That KV-quant adds +0.367% nll → `319.009`
+(matching the Phase 2c-recorded `319.009 @4096` exactly). So the correct same-engine baseline for
+this Q4_K-attn-weight comparison is **319.009**, and Q4_K-output sits at **316.385** (−0.823%) —
+no regression. The drift is the already-merged KV feature, not this work.
+
 **Decode throughput (generation tok/s):**
 
 | Model | ctx=4096 | ctx=16384 | prefill @4096 | prefill @16384 |
