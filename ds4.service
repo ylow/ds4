@@ -1,0 +1,28 @@
+[Unit]
+Description=DeepSeek-V4-Flash inference server (ds4 / DwarfStar) on GB10
+Documentation=https://github.com/antirez/ds4
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ylow/deepseekflash/ds4
+ExecStartPre=/bin/mkdir -p /tmp/ds4-kv
+ExecStart=/home/ylow/deepseekflash/ds4/ds4-server \
+    --cuda \
+    -m /home/ylow/deepseekflash/ds4/ds4flash.gguf \
+    --ctx 131072 \
+    --kv-disk-dir /tmp/ds4-kv \
+    --host 127.0.0.1 \
+    --port 8000
+# Manual control: restart only on unexpected crash, never loop forever.
+Restart=on-failure
+RestartSec=5
+# Model load reads ~80GB; give it room before systemd considers start failed.
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+# NOTE: intentionally NO [Install] section.
+# Without it the service cannot be 'enabled', so it will never autostart on boot.
+# Start it manually with:  systemctl --user start ds4
