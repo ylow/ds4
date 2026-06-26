@@ -366,6 +366,24 @@ static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
     return (size_t)nrows * row_size;
 }
 
+void ds4q_dequantize_q8_0(const void *src, float *dst, int64_t nrows, int64_t ncols) {
+    const int64_t qk = 32;
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q8_0, ncols); /* (ncols/32)*34 */
+    const int64_t blocks_per_row = ncols / qk;
+    for (int64_t r = 0; r < nrows; r++) {
+        const uint8_t *in = (const uint8_t *)src + (size_t)r * row_size;
+        float *out = dst + (size_t)r * ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            uint16_t hd;
+            memcpy(&hd, in, sizeof(hd));
+            const float d = ds4q_f16_to_f32(hd);
+            const int8_t *qs = (const int8_t *)(in + sizeof(hd));
+            for (int j = 0; j < qk; j++) out[b * qk + j] = (float)qs[j] * d;
+            in += sizeof(hd) + qk;
+        }
+    }
+}
+
 static void ds4q_write_q4_k_block_ref(const float *x, uint8_t *y) {
     enum { scales_off = 4, qs_off = 16 };
     uint8_t L[QK_K];

@@ -67,6 +67,9 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
                            const float *imatrix);
 
+/* Dequantize a row-major Q8_0 tensor (ncols % 32 == 0) to f32 (nrows*ncols floats). */
+void ds4q_dequantize_q8_0(const void *src, float *dst, int64_t nrows, int64_t ncols);
+
 float ds4q_f16_to_f32(uint16_t bits);
 float ds4q_bf16_to_f32(uint16_t bits);
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n);
