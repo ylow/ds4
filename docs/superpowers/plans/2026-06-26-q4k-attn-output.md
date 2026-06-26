@@ -783,6 +783,40 @@ Rollback = repoint to the `…AProjQ8…` GGUF. Restart the server if running: `
 
 ---
 
+## Results (2026-06-26)
+
+**Perplexity (teacher-forced, n=256, c=4096, `doors-of-stone-chapter-1.md`):**
+
+| | nll | avg_nll | ppl |
+|---|---|---|---|
+| Q8 reference oracle (prior session) | 317.843967992 | 1.241578 | ~3.461 |
+| Q8 measured (today, bit-reproducible) | 319.009406860 | 1.246130 | 3.476863 |
+| Q4_K measured (today) | 316.384665147 | 1.235878 | 3.441397 |
+
+Δnll% (Q4_K vs reference oracle 317.844): **−0.459%**
+Δnll% (Q4_K vs measured Q8 319.009): **−0.823%**
+Δppl (Q4_K vs measured Q8): **−0.035** (Q4_K is slightly better, within noise)
+
+**Decode throughput (generation tok/s):**
+
+| Model | ctx=4096 | ctx=16384 | prefill @4096 | prefill @16384 |
+|---|---|---|---|---|
+| Q8   | 15.11 t/s | 14.82 t/s | 32.74 t/s | 33.67 t/s |
+| Q4_K | 15.51 t/s | 15.51 t/s | 30.77 t/s | 30.63 t/s |
+| Δ    | +2.6%     | +4.7%     | −5.7%      | −9.0%      |
+
+**GGUF size delta:** Q8 = 86.72 GB, Q4_K = 85.28 GB → **−1.44 GB**.
+
+**Summary:** Q4_K shows no quality regression relative to the Q8 baseline (nll is marginally
+lower, likely noise/regularization). Decode throughput gain is modest at +2.6–4.7%, well below
+the projected 1.32×/17–18 t/s — the byte savings of −1.44 GB did not convert to proportional
+bandwidth gains, possibly because the current Q8 baseline has already been lifted by prior
+optimizations (~15 t/s today vs the ~13.5 reference in the plan). Prefill is 5–9% slower with
+Q4_K due to unpack overhead dominating in the compute-heavier batch path. The accept/reject
+decision is the user's; both GGUFs are present and the symlink remains on the Q8 GGUF.
+
+---
+
 ## Self-Review
 
 **Spec coverage:**

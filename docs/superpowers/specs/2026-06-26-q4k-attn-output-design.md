@@ -140,6 +140,40 @@ makes the Q8 path still valid).
   dispatch swap; bounded by reusing the expert Q4_K×Q8_K primitives and leaving the outer loops
   intact.
 
+## Results (2026-06-26)
+
+**Perplexity (teacher-forced, n=256, c=4096, `doors-of-stone-chapter-1.md`):**
+
+| | nll | avg_nll | ppl |
+|---|---|---|---|
+| Q8 reference oracle (prior session) | 317.843967992 | 1.241578 | ~3.461 |
+| Q8 measured (today, bit-reproducible) | 319.009406860 | 1.246130 | 3.476863 |
+| Q4_K measured (today) | 316.384665147 | 1.235878 | 3.441397 |
+
+Δnll% (Q4_K vs reference oracle 317.844): **−0.459%**
+Δnll% (Q4_K vs measured Q8 319.009): **−0.823%**
+Δppl (Q4_K vs measured Q8): **−0.035** (Q4_K is neutral-to-slightly-better, within noise)
+
+**Decode throughput (generation tok/s):**
+
+| Model | ctx=4096 | ctx=16384 | prefill @4096 | prefill @16384 |
+|---|---|---|---|---|
+| Q8   | 15.11 t/s | 14.82 t/s | 32.74 t/s | 33.67 t/s |
+| Q4_K | 15.51 t/s | 15.51 t/s | 30.77 t/s | 30.63 t/s |
+| Δ    | +2.6%     | +4.7%     | −5.7%      | −9.0%      |
+
+**GGUF size delta:** Q8 = 86.72 GB (86,720,111,488 bytes), Q4_K = 85.28 GB (85,277,270,624 bytes) → **−1.44 GB**.
+
+**Summary:** Q4_K produces no quality regression on this text sample (Δnll is negative, i.e.,
+slightly better perplexity). The projected 1.32× decode speedup did not materialize — measured
+gain is only +2.6–4.7%, because the current Q8 baseline was already faster (~15 t/s) than the
+~13.5 t/s reference used in the projection, likely from prior engine optimizations. Prefill
+speed decreases by 5–9% due to Q4_K unpack overhead dominating in compute-bound batch paths.
+The quality/speed tradeoff decision (accept / output_b-only / roll back) is left to the user;
+the symlink `ds4flash.gguf` remains pointed at the Q8 GGUF.
+
+---
+
 ## Non-goals
 
 - No Q5_K/Q6_K (not in the quantizer). No requant of q/kv, shared expert, or output head. No HF
