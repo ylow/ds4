@@ -1164,8 +1164,58 @@ static void check_reversed_shape(const char *gguf_name, const st_info *info, con
     }
 }
 
+typedef struct gguf_file_s {
+    char *path;
+    uint32_t version;
+    uint64_t n_kv;
+    uint64_t n_tensors;
+    uint8_t *kv_raw;
+    size_t kv_raw_len;
+    size_t alignment;
+    int n_experts;
+    size_t data_offset;
+    tensor_meta *tensors;
+    hmap tensor_map;
+} gguf_file;
+
+static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
+    int idx = hmap_get(&g->tensor_map, name);
+    if (idx < 0) {
+        fprintf(stderr, "error: tensor not found in GGUF: %s\n", name);
+        exit(1);
+    }
+    const tensor_meta *t = &g->tensors[idx];
+    byte_buf b = { .size = t->size, .data = xmalloc(t->size) };
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die_errno("open GGUF", path);
+    if (fseeko(fp, (off_t)(g->data_offset + t->old_offset), SEEK_SET) != 0) die_errno("seek GGUF", path);
+    if (b.size && fread(b.data, 1, b.size, fp) != b.size) die_errno("read GGUF tensor", path);
+    fclose(fp);
+    return b;
+}
+
 static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
-                                 ds4q_type target, const imatrix_store *imatrix) {
+                                 ds4q_type target, const imatrix_store *imatrix,
+                                 const gguf_file *tmpl_file, bool template_requant) {
+    if (template_requant) {
+        byte_buf src_bytes = read_gguf_tensor_data(tmpl_file, tmpl_file->path, gguf_name);
+        if (target == tmpl->type) {
+            return src_bytes;                 /* verbatim copy-through */
+        }
+        if (tmpl->type != DS4Q_TYPE_Q8_0)
+            die("template-requant: only Q8_0 source tensors can be requantized");
+        const int64_t ncols = tmpl->ne[0];
+        const int64_t nrows = tmpl->ne[1];
+        const int64_t n = nrows * ncols;
+        float *f32 = xmalloc((size_t)n * sizeof(float));
+        ds4q_dequantize_q8_0(src_bytes.data, f32, nrows, ncols);
+        free(src_bytes.data);
+        const char *names[1] = { gguf_name };
+        const float *imat = imatrix_find(imatrix, names, 1, ncols, -1, 0);
+        byte_buf b = f32_to_type(f32, n, target, ncols, imat);
+        free(f32);
+        return b;
+    }
     char *hf_name = hf_name_for_regular(gguf_name);
     tensor_entry *te = db_tensor(db, hf_name, NULL);
     check_reversed_shape(gguf_name, &te->info, tmpl);
@@ -1297,11 +1347,16 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
 
 static byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix,
+                                const gguf_file *tmpl_file, bool template_requant) {
     if (parse_expert_tensor(name).is_expert) {
+        if (template_requant) {
+            /* In template-requant mode, experts are byte-copied verbatim from the template */
+            return read_gguf_tensor_data(tmpl_file, tmpl_file->path, name);
+        }
         return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix);
     }
-    return generate_regular(db, name, tmpl, target, imatrix);
+    return generate_regular(db, name, tmpl, target, imatrix, tmpl_file, template_requant);
 }
 
 /* =====
@@ -1316,20 +1371,6 @@ typedef struct {
     size_t start;
     size_t end;
 } byte_span;
-
-typedef struct {
-    char *path;
-    uint32_t version;
-    uint64_t n_kv;
-    uint64_t n_tensors;
-    uint8_t *kv_raw;
-    size_t kv_raw_len;
-    size_t alignment;
-    int n_experts;
-    size_t data_offset;
-    tensor_meta *tensors;
-    hmap tensor_map;
-} gguf_file;
 
 typedef struct {
     tensor_meta *tensors;
@@ -1549,22 +1590,6 @@ static gguf_file load_gguf_metadata(const char *path) {
     return g;
 }
 
-static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
-    int idx = hmap_get(&g->tensor_map, name);
-    if (idx < 0) {
-        fprintf(stderr, "error: tensor not found in GGUF: %s\n", name);
-        exit(1);
-    }
-    const tensor_meta *t = &g->tensors[idx];
-    byte_buf b = { .size = t->size, .data = xmalloc(t->size) };
-    FILE *fp = fopen(path, "rb");
-    if (!fp) die_errno("open GGUF", path);
-    if (fseeko(fp, (off_t)(g->data_offset + t->old_offset), SEEK_SET) != 0) die_errno("seek GGUF", path);
-    if (b.size && fread(b.data, 1, b.size, fp) != b.size) die_errno("read GGUF tensor", path);
-    fclose(fp);
-    return b;
-}
-
 static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < n; i++) {
@@ -1614,7 +1639,7 @@ static void write_padding(FILE *fp, size_t n) {
 
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix) {
+                            const imatrix_store *imatrix, bool template_requant) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
@@ -1640,7 +1665,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix, tmpl, template_requant);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
@@ -1691,6 +1716,7 @@ typedef struct {
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
+    bool template_requant;
 } params;
 
 static void usage(const char *argv0) {
@@ -1764,6 +1790,8 @@ static params parse_args(int argc, char **argv) {
             p.overwrite = true;
         } else if (strcmp(arg, "--dry-run") == 0) {
             p.dry_run = true;
+        } else if (strcmp(arg, "--template-requant") == 0) {
+            p.template_requant = true;
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
@@ -1805,7 +1833,7 @@ static params parse_args(int argc, char **argv) {
             exit(1);
         }
     }
-    if (!p.hf_dir) die("--hf is required");
+    if (!p.hf_dir && !p.template_requant) die("--hf is required (or use --template-requant)");
     if (!p.template_gguf) die("--template is required");
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
@@ -1832,7 +1860,8 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
-                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
+                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix,
+                                         tmpl, p->template_requant);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
@@ -1885,20 +1914,20 @@ int main(int argc, char **argv) {
     print_plan(&tmpl, &out_ctx);
     if (p.dry_run) return 0;
 
-    st_db db;
-    db_open(&db, p.hf_dir);
+    st_db db; bool db_ready = false;
+    if (!p.template_requant) { db_open(&db, p.hf_dir); db_ready = true; }
     if (p.compare_tensor) {
-        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
-        db_close(&db);
+        compare_one_tensor(db_ready ? &db : NULL, &tmpl, &out_ctx, &p, &imatrix);
+        if (db_ready) db_close(&db);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(db_ready ? &db : NULL, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, p.template_requant);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
-    db_close(&db);
+    if (db_ready) db_close(&db);
     imatrix_free(&imatrix);
     free_gguf_file(&tmpl);
     free(out_ctx.tensors);
