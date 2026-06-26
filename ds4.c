@@ -2624,6 +2624,32 @@ static DS4_MAYBE_UNUSED float dsv4_e2m1fn_decode_nibble_cpu(uint8_t nib) {
     return (nib & 0x8u) ? -mag : mag;
 }
 
+/* NormalFloat4 (NF4) host codec mirroring nf4_level_dev / nf4_index_dev / nf4_decode_nibble_dev
+ * for the Hadamard-FP4 compressed-attention NoPE dims (save/load, cache-trace, self-check). */
+static float nf4_level_cpu(int i) {
+    static const float v[16] = {
+        -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+        -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+        0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+        0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f,
+    };
+    return v[i & 15];
+}
+
+static DS4_MAYBE_UNUSED float nf4_decode_nibble_cpu(uint8_t nib) {
+    return nf4_level_cpu((int)(nib & 0xfu));
+}
+
+static DS4_MAYBE_UNUSED uint8_t nf4_index_cpu(float x) {
+    int best = 0;
+    float best_diff = fabsf(x - nf4_level_cpu(0));
+    for (int i = 1; i < 16; i++) {
+        const float diff = fabsf(x - nf4_level_cpu(i));
+        if (diff < best_diff) { best = i; best_diff = diff; }
+    }
+    return (uint8_t)best;
+}
+
 /* The official DeepSeek V4 graph rotates indexer activations with a 128-wide
  * Hadamard transform and immediately runs the FP4 activation-simulation
  * round trip. This applies to both indexer Q and the indexer compressor KV;
@@ -10383,7 +10409,11 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * value self-check.  Takes PRECEDENCE over _FP8 -> _F16 -> F32 when on.  Default OFF; flipped
  * on for CUDA in the final step so it can be reverted independently.
  */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#define DS4_GPU_ATTN_COMP_CACHE_FP4 1
+#else
 #define DS4_GPU_ATTN_COMP_CACHE_FP4 0
+#endif
 
 /*
  * The indexer-compressed KV cache (128-dim per row) is the long-context
@@ -13696,18 +13726,17 @@ static DS4_MAYBE_UNUSED void metal_graph_fp4_selfcheck(
             dsv4_hadamard64_inplace_cpu(grp);
             float amax = 7.052966104933725e-38f;
             for (uint32_t l = 0; l < 64u; l++) { float a = fabsf(grp[l]); if (a > amax) amax = a; }
-            int e2; const float fr = frexpf(amax / 6.0f, &e2);
+            int e2; const float fr = frexpf(amax, &e2);
             const int k = (fr == 0.5f) ? (e2 - 1) : e2;
             const float scale = ldexpf(1.0f, k);
             if ((int)xe[(size_t)r * 8u + (off >> 6)] != k) byte_mismatch++;
             for (uint32_t l = 0; l < 64u; l++) {
-                float v = grp[l] / scale; if (v > 6.0f) v = 6.0f; if (v < -6.0f) v = -6.0f;
-                const uint8_t want = dsv4_e2m1fn_index_cpu(v);
+                const uint8_t want = nf4_index_cpu(grp[l] / scale);
                 const uint8_t byte = gb[(size_t)r * half + (off + l) / 2u];
                 const uint8_t got  = ((off + l) & 1u) ? (byte >> 4) : (byte & 0xfu);
                 if (got != want) byte_mismatch++;
-                const float dgot  = dsv4_e2m1fn_decode_nibble_cpu(got)  * scale;
-                const float dwant = dsv4_e2m1fn_decode_nibble_cpu(want) * scale;
+                const float dgot  = nf4_decode_nibble_cpu(got)  * scale;
+                const float dwant = nf4_decode_nibble_cpu(want) * scale;
                 if (dgot != dwant) val_mismatch++;
             }
         }
@@ -22037,7 +22066,7 @@ static int metal_graph_prompt_logits_test(
                                 for (uint32_t l = 0; l < 64u; l++) {
                                     const uint8_t byte = cb[(size_t)r * (n_nope / 2u) + (off + l) / 2u];
                                     const uint8_t nib = ((off + l) & 1u) ? (byte >> 4) : (byte & 0xfu);
-                                    grp[l] = dsv4_e2m1fn_decode_nibble_cpu(nib) * ldexpf(1.0f, k);
+                                    grp[l] = nf4_decode_nibble_cpu(nib) * ldexpf(1.0f, k);
                                 }
                                 dsv4_hadamard64_inplace_cpu(grp);
                                 for (uint32_t l = 0; l < 64u; l++)
@@ -24241,7 +24270,7 @@ static DS4_MAYBE_UNUSED int payload_write_tensor_span_fp4split_as_f32(
                 for (uint32_t l = 0; l < 64u; l++) {
                     const uint8_t byte = nrow[(off + l) / 2u];
                     const uint8_t nib = ((off + l) & 1u) ? (byte >> 4) : (byte & 0xfu);
-                    grp[l] = dsv4_e2m1fn_decode_nibble_cpu(nib) * ldexpf(1.0f, k);
+                    grp[l] = nf4_decode_nibble_cpu(nib) * ldexpf(1.0f, k);
                 }
                 dsv4_hadamard64_inplace_cpu(grp);
                 for (uint32_t l = 0; l < 64u; l++) frow[off + l] = grp[l];
@@ -24298,18 +24327,13 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_fp4split(
                     if (av > amax) amax = av;
                 }
                 int e2;
-                const float fr = frexpf(amax / 6.0f, &e2);
+                const float fr = frexpf(amax, &e2);
                 const int k = (fr == 0.5f) ? (e2 - 1) : e2;
                 const float scale = ldexpf(1.0f, k);
                 erow[off >> 6] = (int8_t)k;
                 for (uint32_t l = 0; l < 64u; l += 2u) {
-                    float v0 = grp[l] / scale, v1 = grp[l + 1] / scale;
-                    if (v0 > 6.0f) v0 = 6.0f;
-                    if (v0 < -6.0f) v0 = -6.0f;
-                    if (v1 > 6.0f) v1 = 6.0f;
-                    if (v1 < -6.0f) v1 = -6.0f;
                     nrow[(off + l) / 2u] =
-                        (uint8_t)(dsv4_e2m1fn_index_cpu(v0) | (dsv4_e2m1fn_index_cpu(v1) << 4));
+                        (uint8_t)(nf4_index_cpu(grp[l] / scale) | (nf4_index_cpu(grp[l + 1] / scale) << 4));
                 }
             }
             for (uint32_t d = 0; d < DS4_N_ROT; d++)

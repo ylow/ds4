@@ -4564,9 +4564,46 @@ __device__ static float dsv4_e2m1fn_dequant_dev(float x) {
 
 /* Decode a stored E2M1FN nibble back to float: bit3 = sign, bits0..2 = magnitude
  * index into dsv4_e2m1fn_value_dev.  Sibling of dsv4_e4m3fn_decode_byte_dev. */
-__device__ static float dsv4_e2m1fn_decode_nibble_dev(uint8_t nib) {
+__device__ static DS4_CUDA_UNUSED float dsv4_e2m1fn_decode_nibble_dev(uint8_t nib) {
     float mag = dsv4_e2m1fn_value_dev((int)(nib & 0x7u));
     return (nib & 0x8u) ? -mag : mag;
+}
+
+/* NormalFloat4 (NF4): 16 levels = quantiles of a unit Gaussian on [-1,1].  Used for the
+ * Hadamard-FP4 compressed-attention NoPE dims, whose post-rotation distribution is ~Gaussian
+ * (E2M1's exponential level spacing is mismatched there).  Full 4-bit nibble, no sign bit. */
+__device__ static float nf4_level_dev(int i) {
+    switch (i & 15) {
+    case 0:  return -1.0f;
+    case 1:  return -0.6961928009986877f;
+    case 2:  return -0.5250730514526367f;
+    case 3:  return -0.39491748809814453f;
+    case 4:  return -0.28444138169288635f;
+    case 5:  return -0.18477343022823334f;
+    case 6:  return -0.09105003625154495f;
+    case 7:  return 0.0f;
+    case 8:  return 0.07958029955625534f;
+    case 9:  return 0.16093020141124725f;
+    case 10: return 0.24611230194568634f;
+    case 11: return 0.33791524171829224f;
+    case 12: return 0.44070982933044434f;
+    case 13: return 0.5626170039176941f;
+    case 14: return 0.7229568362236023f;
+    default: return 1.0f;
+    }
+}
+
+__device__ static float nf4_decode_nibble_dev(uint8_t nib) { return nf4_level_dev((int)(nib & 0xfu)); }
+
+/* Nearest NF4 level index (0..15) to an already-scaled value in [-1,1]; ties -> lower index. */
+__device__ static uint8_t nf4_index_dev(float x) {
+    int best = 0;
+    float best_diff = fabsf(x - nf4_level_dev(0));
+    for (int i = 1; i < 16; i++) {
+        float diff = fabsf(x - nf4_level_dev(i));
+        if (diff < best_diff) { best = i; best_diff = diff; }
+    }
+    return (uint8_t)best;
 }
 
 /* In-place 64-wide normalized Walsh-Hadamard on shared vals[0..63] across exactly 64
@@ -4608,7 +4645,7 @@ __global__ static void expand_comp_fp4_to_f32_kernel(
     for (uint32_t g = 0; g < n_grp; g++) {
         const uint8_t byte = nr[g * 32u + (tid >> 1)];
         const uint8_t nib  = (tid & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
-        vals[tid] = dsv4_e2m1fn_decode_nibble_dev(nib) * exp2f((float)er[g]);
+        vals[tid] = nf4_decode_nibble_dev(nib) * exp2f((float)er[g]);
         __syncthreads();
         hadamard64_shared(vals, tid);
         orow[g * 64u + tid] = vals[tid];
@@ -4645,7 +4682,7 @@ __global__ static void gather_comp_fp4_to_f32_kernel(
     for (uint32_t g = 0; g < n_grp; g++) {
         const uint8_t byte = nr[g * 32u + (tid >> 1)];
         const uint8_t nib  = (tid & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
-        vals[tid] = dsv4_e2m1fn_decode_nibble_dev(nib) * exp2f((float)er[g]);
+        vals[tid] = nf4_decode_nibble_dev(nib) * exp2f((float)er[g]);
         __syncthreads();
         hadamard64_shared(vals, tid);
         od[g * 64u + tid] = vals[tid];
@@ -4657,7 +4694,7 @@ __global__ static void gather_comp_fp4_to_f32_kernel(
 
 /* Encode an already-scaled value (|x| clamped to 6) to an E2M1FN nibble: bit3 = sign,
  * bits0..2 = the magnitude index dsv4_e2m1fn_dequant_dev would pick (same tie-break). */
-__device__ static uint8_t dsv4_e2m1fn_index_dev(float x) {
+__device__ static DS4_CUDA_UNUSED uint8_t dsv4_e2m1fn_index_dev(float x) {
     uint8_t sign = (x < 0.0f) ? 0x8u : 0x0u;
     float ax = fminf(fabsf(x), 6.0f);
     int best = 0;
@@ -4673,7 +4710,7 @@ __device__ static uint8_t dsv4_e2m1fn_index_dev(float x) {
 }
 
 /* Commit `rows` staged F32 comp rows to the Hadamard-FP4 cache.  One block/row, 64 threads.
- * Per 64-group: rotate (hadamard64_shared), amax-reduce, frexp-exact k, E2M1 nibble-pack +
+ * Per 64-group: rotate (hadamard64_shared), amax-reduce, frexp-exact k, NF4 nibble-pack +
  * int8 exponent; RoPE tail -> F16.  Lossy vs the staged E4M3 value (this is the 4-bit step),
  * but decode reproduces the codec's own output bit-for-bit (verified by the value self-check). */
 __global__ static void quantize_comp_f32_to_fp4split_kernel(
@@ -4702,10 +4739,10 @@ __global__ static void quantize_comp_f32_to_fp4split_kernel(
             __syncthreads();
         }
         int e2;
-        float fr = frexpf(fmaxf(amaxbuf[0], 7.052966104933725e-38f) / 6.0f, &e2);
+        float fr = frexpf(fmaxf(amaxbuf[0], 7.052966104933725e-38f), &e2);
         int k = (fr == 0.5f) ? (e2 - 1) : e2;
         float scale = exp2f((float)k);
-        nibs[tid] = dsv4_e2m1fn_index_dev(fminf(6.0f, fmaxf(-6.0f, vals[tid] / scale)));
+        nibs[tid] = nf4_index_dev(vals[tid] / scale);
         __syncthreads();
         if (tid < 32u)
             nr[g * 32u + tid] = (uint8_t)(nibs[2u * tid] | (nibs[2u * tid + 1u] << 4));
