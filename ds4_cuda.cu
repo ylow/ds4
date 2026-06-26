@@ -11165,6 +11165,61 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 
+/* Q4_K attention output_a kernel: twin of grouped_q8_0_a_preq_warp8_kernel,
+ * with activation already quantized to Q8_K (one block_q8_K per 256 activations)
+ * and weights stored as cuda_block_q4_K (144 bytes/block, 256 weights/block). */
+__global__ static void grouped_q4k_a_preq_warp8_kernel(
+        float *low, const unsigned char *w, const cuda_block_q8_K *xq,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint32_t n_tokens,
+        uint64_t blocks, int use_dp4a) {
+    (void)use_dp4a;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim || tok >= n_tokens) return;
+    const uint64_t group = row / rank;
+    const uint64_t row_in_group = row - group * rank;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)w + (group * rank + row_in_group) * blocks;
+    const uint64_t xrow = tok * (uint64_t)n_groups + group;
+    const cuda_block_q8_K *xqr = xq + xrow * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqr + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) low[tok * low_dim + row] = acc;
+}
+
+extern "C" int ds4_gpu_attention_output_low_q4k_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    if (!low || !heads || !model_map || group_dim == 0 || rank == 0 ||
+        n_groups == 0 || n_tokens == 0 || (group_dim % 256u) != 0) return 0;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t blocks_a = group_dim / 256u;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 144u; /* sizeof(cuda_block_q4_K) */
+    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float)) return 0;
+    const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
+            cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a_q4k"));
+    if (!out_a) return 0;
+    const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
+    const uint64_t tmp_bytes = x_rows * blocks_a * sizeof(cuda_block_q8_K);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "attn output low q4k prequant");
+    if (!tmp) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)tmp;
+    dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
+    q8_K_quantize_kernel<<<qgrid, 256>>>(xq, (const float *)heads->ptr, (uint32_t)group_dim, (uint32_t)x_rows);
+    if (!cuda_ok(cudaGetLastError(), "attn_output_low_q4k prequant launch")) return 0;
+    dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
+    grouped_q4k_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr, out_a, xq,
+            group_dim, rank, n_groups, n_tokens, blocks_a, 0);
+    return cuda_ok(cudaGetLastError(), "attn_output_low_q4k launch");
+}
+
 __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_kernel(
         float *gate_out,
         float *up_out,
