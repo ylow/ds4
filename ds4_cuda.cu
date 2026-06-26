@@ -3660,6 +3660,142 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     }
 }
 
+__device__ static float warp_sum_f32(float v);
+
+/* Bit-identical, vectorized variant of matmul_f16_ordered_chunks_kernel: each
+ * thread still sums the SAME contiguous chunk [tid*chunk, tid*chunk+chunk) and
+ * the final 32-way reduction on thread 0 is unchanged, so results are bit-for-bit
+ * identical -- only the per-thread inner loop is widened to 128-bit loads (8 halfs
+ * + 8 floats per step, accumulated with the same per-element += order). Used for
+ * the indexer/single-F16 path, whose downstream top-k selection is sensitive to
+ * any reduction reordering. Requires in_dim % 8 == 0 and chunk % 8 == 0. */
+__global__ static void matmul_f16_ordered_chunks_vec_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+    __shared__ float partial[32];
+    const uint32_t tid = threadIdx.x;
+    float sum = 0.0f;
+    const uint64_t chunk = (in_dim + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)tid * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    uint64_t i = k0;
+    for (; i + 8u <= k1; i += 8u) {
+        const int4 raw = *(const int4 *)(wr + i);
+        const __half *hh = (const __half *)&raw;
+        const float4 xa = *(const float4 *)(xr + i);
+        const float4 xb = *(const float4 *)(xr + i + 4);
+        sum += __half2float(hh[0]) * xa.x;
+        sum += __half2float(hh[1]) * xa.y;
+        sum += __half2float(hh[2]) * xa.z;
+        sum += __half2float(hh[3]) * xa.w;
+        sum += __half2float(hh[4]) * xb.x;
+        sum += __half2float(hh[5]) * xb.y;
+        sum += __half2float(hh[6]) * xb.z;
+        sum += __half2float(hh[7]) * xb.w;
+    }
+    for (; i < k1; i++) sum += __half2float(wr[i]) * xr[i];
+    partial[tid] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint32_t j = 0; j < 32u; j++) total += partial[j];
+        out[tok * out_dim + row] = total;
+    }
+}
+
+/* Coalesced, high-occupancy F16 GEMV for decode (n_tok=1, in_dim % 256 == 0).
+ * One warp owns one output row; the 32 lanes stride the row with 128-bit loads
+ * (8 halfs/load) so consecutive lanes touch consecutive 16-byte regions -> fully
+ * coalesced 512B warp transactions (vs the ordered-chunks kernel's strided 2B
+ * loads + serial 32-way reduction on one thread). 8 warps/block => 256 threads.
+ * NOTE: the warp-shuffle reduction reassociates the dot product, so the result
+ * is NOT bit-identical to matmul_f16_ordered_chunks_kernel (validated separately
+ * against the perplexity oracle). */
+__global__ static void matmul_f16_coalesced_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    float sum = 0.0f;
+    for (uint64_t i = (uint64_t)lane * 8u; i + 8u <= in_dim; i += 256u) {
+        const float4 xa = *(const float4 *)(xr + i);
+        const float4 xb = *(const float4 *)(xr + i + 4);
+        const int4 raw = *(const int4 *)(wr + i);
+        const __half *hh = (const __half *)&raw;
+        sum += __half2float(hh[0]) * xa.x + __half2float(hh[1]) * xa.y
+             + __half2float(hh[2]) * xa.z + __half2float(hh[3]) * xa.w
+             + __half2float(hh[4]) * xb.x + __half2float(hh[5]) * xb.y
+             + __half2float(hh[6]) * xb.z + __half2float(hh[7]) * xb.w;
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0) out[tok * out_dim + row] = sum;
+}
+
+__global__ static void matmul_f16_pair_coalesced_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
+    const bool do0 = row < out0_dim;
+    const bool do1 = row < out1_dim;
+    if (!do0 && !do1) return;
+    const __half *wr0 = w0 + row * in_dim;
+    const __half *wr1 = w1 + row * in_dim;
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (uint64_t i = (uint64_t)lane * 8u; i + 8u <= in_dim; i += 256u) {
+        const float4 xa = *(const float4 *)(x + i);
+        const float4 xb = *(const float4 *)(x + i + 4);
+        if (do0) {
+            const int4 raw = *(const int4 *)(wr0 + i);
+            const __half *hh = (const __half *)&raw;
+            sum0 += __half2float(hh[0]) * xa.x + __half2float(hh[1]) * xa.y
+                  + __half2float(hh[2]) * xa.z + __half2float(hh[3]) * xa.w
+                  + __half2float(hh[4]) * xb.x + __half2float(hh[5]) * xb.y
+                  + __half2float(hh[6]) * xb.z + __half2float(hh[7]) * xb.w;
+        }
+        if (do1) {
+            const int4 raw = *(const int4 *)(wr1 + i);
+            const __half *hh = (const __half *)&raw;
+            sum1 += __half2float(hh[0]) * xa.x + __half2float(hh[1]) * xa.y
+                  + __half2float(hh[2]) * xa.z + __half2float(hh[3]) * xa.w
+                  + __half2float(hh[4]) * xb.x + __half2float(hh[5]) * xb.y
+                  + __half2float(hh[6]) * xb.z + __half2float(hh[7]) * xb.w;
+        }
+    }
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+    if (lane == 0) {
+        if (do0) out0[row] = sum0;
+        if (do1) out1[row] = sum1;
+    }
+}
+
 __global__ static void matmul_f32_kernel(
         float *out,
         const float *w,
@@ -8570,6 +8706,22 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
     }
     if (ordered_router) {
+        /* Single-F16 path feeds the indexer's discrete top-k selection, which is
+         * sensitive to reduction reordering (coalesced reorder regresses nll ~1%).
+         * So this stays on the bit-exact ordered-chunks kernel unless explicitly
+         * opted in; only the comp-KV pair uses the coalesced reorder by default. */
+        static int f16_coalesced = -1;
+        if (f16_coalesced < 0) f16_coalesced = (getenv("DS4_F16S_COALESCED_ON") != NULL && getenv("DS4_F16_COALESCED_OFF") == NULL) ? 1 : 0;
+        if (f16_coalesced && (in_dim % 256u) == 0u) {
+            dim3 cgrid((unsigned)((out_dim + 7u) / 8u), (unsigned)n_tok, 1);
+            matmul_f16_coalesced_kernel<<<cgrid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_coalesced launch");
+        }
+        const uint64_t chunk = (in_dim + 31u) / 32u;
+        if (getenv("DS4_F16_VEC_OFF") == NULL && (in_dim % 8u) == 0u && (chunk % 8u) == 0u) {
+            matmul_f16_ordered_chunks_vec_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks_vec launch");
+        }
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
@@ -8616,6 +8768,21 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
+    static int f16p_coalesced = -1;
+    if (f16p_coalesced < 0) f16p_coalesced = (getenv("DS4_F16_COALESCED_OFF") != NULL || getenv("DS4_F16P_COALESCED_OFF") != NULL) ? 0 : 1;
+    if (f16p_coalesced && (in_dim % 256u) == 0u) {
+        dim3 cgrid((unsigned)((out_dim + 7u) / 8u), 1, 1);
+        matmul_f16_pair_coalesced_kernel<<<cgrid, 256>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_coalesced launch");
+    }
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
@@ -11528,6 +11695,74 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     }
 }
 
+/* Higher-occupancy variant of moe_gate_up_mid_decode_lut_qwarp32_kernel: one
+ * block handles exactly 32 mid-rows (256 threads / 8 lanes) with no rr loop, so
+ * the grid is 4x wider (expert_mid_dim/32 x-tiles instead of /128). For decode
+ * (n_tokens=1, n_expert=6, mid=2048) that is 64x6=384 blocks vs 16x6=96, lifting
+ * resident warps per SM ~4x to hide the IQ2_XXS LUT-dequant latency. The per-row
+ * 8-lane reduction is unchanged, so results are bit-identical to the 128-row kernel. */
+__global__ static void moe_gate_up_mid_decode_lut_qwarp32_occ_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    uint32_t row = blockIdx.x * 32u + row_lane;
+    if (row >= expert_mid_dim) return;
+    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+    }
+    gate = quarter_warp_sum_f32(gate, lane);
+    up = quarter_warp_sum_f32(up, lane);
+    if (lane == 0) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (write_aux) {
+            gate_out[off] = gate;
+            up_out[off] = up;
+        }
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
 __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
@@ -13616,6 +13851,31 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
+                    /* Higher-occupancy 32-row tiling is bit-exact but measured
+                     * neutral (the LUT dequant is ALU-bound, not occupancy-bound),
+                     * so it stays off unless explicitly enabled. */
+                    static int gu_occ = -1;
+                    if (gu_occ < 0) gu_occ = getenv("DS4_MOE_GU_OCC_ON") != NULL ? 1 : 0;
+                    if (gu_occ) {
+                        /* 32 rows/block -> 4x wider grid, higher occupancy; bit-identical. */
+                        dim3 qgrid_occ((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
+                        moe_gate_up_mid_decode_lut_qwarp32_occ_kernel<<<qgrid_occ, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            selected_ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            clamp);
+                    } else {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -13632,6 +13892,7 @@ static int routed_moe_launch(
                         n_expert,
                         write_gate_up,
                         clamp);
+                    }
                 } else {
                     moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
