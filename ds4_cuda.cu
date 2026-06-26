@@ -14332,3 +14332,114 @@ extern "C" int ds4_gpu_matmul_q4k_hc_expand_tensor(
             0);  /* use_dp4a: unused in Q4_K path */
     return cuda_ok(cudaGetLastError(), "matmul_q4k_hc_expand launch");
 }
+
+/* Q4_K plain matmul kernel (n_tok=1): twin of matmul_q8_0_preq_warp8_kernel.
+ * Weight stored as cuda_block_q4_K (144 B/block, 256 weights/block).
+ * Activation pre-quantized to Q8_K (one cuda_block_q8_K per 256 elements).
+ * blocks = in_dim / 256. */
+__global__ static void matmul_q4k_preq_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const cuda_block_q8_K *xq,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    (void)in_dim;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)w + row * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+/* Q4_K plain matmul kernel (n_tok>1): twin of matmul_q8_0_preq_batch_warp8_kernel.
+ * tok = blockIdx.y indexes the activation row (xq + tok*blocks) and output row
+ * (out[tok*out_dim + row]), exactly as the Q8_0 batch twin does. */
+__global__ static void matmul_q4k_preq_batch_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const cuda_block_q8_K *xq,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    (void)in_dim;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim || tok >= n_tok) return;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)w + row * blocks;
+    const cuda_block_q8_K *xqr = xq + tok * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqr + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[tok * out_dim + row] = acc;
+}
+
+/* Host wrapper: Q4_K plain matmul, NATIVE only (no cuBLAS path).
+ * Modeled on the native fallback section of cuda_matmul_q8_0_tensor_labeled.
+ * Guards (in_dim % 256) == 0 (Q8_K block size). */
+extern "C" int ds4_gpu_matmul_q4k_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map) return 0;
+    if ((in_dim % 256u) != 0) return 0;
+    const uint64_t blocks = in_dim / 256u;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 144u)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 144u; /* sizeof(cuda_block_q4_K) */
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q4k");
+    if (!wptr) return 0;
+    const uint64_t tmp_bytes = n_tok * blocks * sizeof(cuda_block_q8_K);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q4k prequant");
+    if (!tmp) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)tmp;
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1u);
+    q8_K_quantize_kernel<<<qgrid, 256>>>(xq, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
+    if (!cuda_ok(cudaGetLastError(), "matmul_q4k quantize launch")) return 0;
+    if (n_tok == 1) {
+        matmul_q4k_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                in_dim,
+                out_dim,
+                blocks);
+        return cuda_ok(cudaGetLastError(), "matmul_q4k warp launch");
+    }
+    dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1u);
+    matmul_q4k_preq_batch_warp8_kernel<<<bgrid, 256>>>(
+            (float *)out->ptr,
+            reinterpret_cast<const unsigned char *>(wptr),
+            xq,
+            in_dim,
+            out_dim,
+            n_tok,
+            blocks);
+    return cuda_ok(cudaGetLastError(), "matmul_q4k batch warp launch");
+}
+
+/* Batch output wrapper: output_a (Q4_K grouped projection) followed by
+ * output_b (Q4_K plain matmul).  Modeled on ds4_gpu_attention_output_q8_batch_tensor
+ * but native-only (no cuBLAS).  output_a is delegated to Task 4's
+ * ds4_gpu_attention_output_low_q4k_tensor; output_b to ds4_gpu_matmul_q4k_tensor. */
+extern "C" int ds4_gpu_attention_output_q4k_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (!ds4_gpu_attention_output_low_q4k_tensor(low, model_map, model_size, out_a_offset,
+            group_dim, rank, n_groups, heads, n_tokens)) return 0;
+    return ds4_gpu_matmul_q4k_tensor(out, model_map, model_size, out_b_offset,
+            low_dim, out_dim, low, n_tokens);
+}

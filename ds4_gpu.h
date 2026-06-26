@@ -1087,6 +1087,32 @@ int ds4_gpu_matmul_q4k_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* Q4_K plain matmul (output_b): native-only, n_tok x in_dim -> n_tok x out_dim. */
+int ds4_gpu_matmul_q4k_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* Q4_K batch attention output: output_a (grouped projection) then output_b (plain matmul). */
+int ds4_gpu_attention_output_q4k_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens);
+
 #ifdef __cplusplus
 }
 #endif
