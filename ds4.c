@@ -3743,9 +3743,9 @@ static void weights_validate_layout(
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_q8_0_or_q4_k_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_q8_0_or_q4_k_layout(l->ffn_up_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_q8_0_or_q4_k_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (il < DS4_N_HASH_LAYER) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
@@ -3793,9 +3793,9 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
         ds4_die("MTP routed gate/up experts use different quant types");
     }
-    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+    tensor_expect_q8_0_or_q4_k_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_q8_0_or_q4_k_layout(l->ffn_up_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_q8_0_or_q4_k_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
 }
 
 static bool ds4_shape_matches_metadata(
@@ -16137,12 +16137,10 @@ static bool metal_graph_encode_decode_layer(
                                                              g->ffn_norm,
                                                              DS4_SWIGLU_CLAMP_EXP) != 0;
         } else if (ok) {
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
-                                                      layer->ffn_gate_shexp->abs_offset,
+            if (ok) ok = metal_graph_matmul_typed(g->shared_gate, model, layer->ffn_gate_shexp,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
-                                                      layer->ffn_up_shexp->abs_offset,
+            if (ok) ok = metal_graph_matmul_typed(g->shared_up, model, layer->ffn_up_shexp,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
             if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
@@ -16196,8 +16194,7 @@ static bool metal_graph_encode_decode_layer(
                                                              DS4_N_EMBD,
                                                              DS4_N_HC) != 0;
         } else if (ok) {
-            ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
-                                              layer->ffn_down_shexp->abs_offset,
+            ok = metal_graph_matmul_typed(g->shared_out, model, layer->ffn_down_shexp,
                                               shared_dim, DS4_N_EMBD,
                                               g->shared_mid, 1) != 0;
         }
@@ -16273,12 +16270,10 @@ static bool metal_graph_encode_decode_layer(
                                                              g->ffn_norm,
                                                              DS4_SWIGLU_CLAMP_EXP) != 0;
         } else if (ok) {
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
-                                                      layer->ffn_gate_shexp->abs_offset,
+            if (ok) ok = metal_graph_matmul_typed(g->shared_gate, model, layer->ffn_gate_shexp,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
-                                                      layer->ffn_up_shexp->abs_offset,
+            if (ok) ok = metal_graph_matmul_typed(g->shared_up, model, layer->ffn_up_shexp,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
             if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
@@ -16286,8 +16281,7 @@ static bool metal_graph_encode_decode_layer(
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
         if (ok && !fuse_shared_down_hc) {
-            ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
-                                              layer->ffn_down_shexp->abs_offset,
+            ok = metal_graph_matmul_typed(g->shared_out, model, layer->ffn_down_shexp,
                                               shared_dim, DS4_N_EMBD,
                                               g->shared_mid, 1) != 0;
         }
@@ -16457,12 +16451,10 @@ static bool metal_graph_encode_decode_layer(
                                                          g->ffn_norm,
                                                          DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
-                                                  layer->ffn_gate_shexp->abs_offset,
+        if (ok) ok = metal_graph_matmul_typed(g->shared_gate, model, layer->ffn_gate_shexp,
                                                   DS4_N_EMBD, shared_dim,
                                                   g->ffn_norm, 1) != 0;
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
-                                                  layer->ffn_up_shexp->abs_offset,
+        if (ok) ok = metal_graph_matmul_typed(g->shared_up, model, layer->ffn_up_shexp,
                                                   DS4_N_EMBD, shared_dim,
                                                   g->ffn_norm, 1) != 0;
         if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
@@ -16484,8 +16476,7 @@ static bool metal_graph_encode_decode_layer(
                                                          DS4_N_EMBD,
                                                          DS4_N_HC) != 0;
     } else if (ok) {
-        ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
-                                          layer->ffn_down_shexp->abs_offset,
+        ok = metal_graph_matmul_typed(g->shared_out, model, layer->ffn_down_shexp,
                                           shared_dim, DS4_N_EMBD,
                                           g->shared_mid, 1) != 0;
     }
