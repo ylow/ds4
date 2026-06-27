@@ -985,10 +985,18 @@ typedef struct {
 
 typedef struct {
     ds4q_type routed_w1, routed_w2, routed_w3;
-    ds4q_type attention_proj, attention, shared, embedding, output, dense;
+    ds4q_type attention_proj, attention, shared, embedding, output, dense, attn_qkv;
     type_override *overrides;
     int n_overrides;
 } quant_policy;
+
+/* q/kv input projections only (NOT the output projection) -- the low-ALU Q4_1
+ * target, dispatched in the engine by the generic + pair Q8/Q4_1 matmuls. */
+static bool is_attn_qkv(const char *name) {
+    if (strstr(name, ".indexer.")) return false;  /* indexer query stays F16 (top-k sensitive) */
+    return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
+           strstr(name, ".attn_q_b.weight");
+}
 
 static bool is_attention_projection(const char *name) {
     return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
@@ -1045,6 +1053,7 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
     if (strcmp(name, "token_embd.weight") == 0 && p->embedding != DS4Q_TYPE_COUNT) return p->embedding;
     if (is_output_tensor(name) && p->output != DS4Q_TYPE_COUNT) return p->output;
     if (is_shared_expert(name) && p->shared != DS4Q_TYPE_COUNT) return p->shared;
+    if (is_attn_qkv(name) && p->attn_qkv != DS4Q_TYPE_COUNT) return p->attn_qkv;
     if (is_attention_projection(name) && p->attention_proj != DS4Q_TYPE_COUNT) return p->attention_proj;
     if (is_attention_tensor(name) && p->attention != DS4Q_TYPE_COUNT) return p->attention;
     if (p->dense != DS4Q_TYPE_COUNT) return p->dense;
@@ -1768,6 +1777,7 @@ static params parse_args(int argc, char **argv) {
     p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = DS4Q_TYPE_COUNT;
     p.policy.attention_proj = p.policy.attention = p.policy.shared = DS4Q_TYPE_COUNT;
     p.policy.embedding = p.policy.output = p.policy.dense = DS4Q_TYPE_COUNT;
+    p.policy.attn_qkv = DS4Q_TYPE_COUNT;
     p.n_experts = 0;
     p.n_threads = 8;
 
@@ -1805,6 +1815,8 @@ static params parse_args(int argc, char **argv) {
             p.policy.routed_w2 = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--routed-w3") == 0 || strcmp(arg, "--routed-up") == 0) {
             p.policy.routed_w3 = parse_type(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--attn-qkv") == 0) {
+            p.policy.attn_qkv = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--attention-proj") == 0 || strcmp(arg, "--attn-proj") == 0) {
             p.policy.attention_proj = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--attention") == 0) {

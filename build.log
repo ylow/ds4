@@ -1,0 +1,22 @@
+make -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+make[1]: Entering directory '/home/ylow/deepseekflash/ds4'
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_cli.o ds4_cli.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_help.o ds4_help.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o linenoise.o linenoise.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4.o ds4.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_distributed.o ds4_distributed.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_ssd.o ds4_ssd.c
+/usr/local/cuda/bin/nvcc -O3 -g -lineinfo --use_fast_math  -Xcompiler -march=native -Xcompiler -pthread -c -o ds4_cuda.o ds4_cuda.cu
+/usr/local/cuda/bin/nvcc -O3 -g -lineinfo --use_fast_math  -Xcompiler -march=native -Xcompiler -pthread -o ds4 ds4_cli.o ds4_help.o linenoise.o ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o -lm -Xcompiler -pthread -L/usr/local/cuda/targets/sbsa-linux/lib -L/usr/local/cuda/lib64 -lcudart -lcublas
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_server.o ds4_server.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_kvstore.o ds4_kvstore.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o rax.o rax.c
+/usr/local/cuda/bin/nvcc -O3 -g -lineinfo --use_fast_math  -Xcompiler -march=native -Xcompiler -pthread -o ds4-server ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o -lm -Xcompiler -pthread -L/usr/local/cuda/targets/sbsa-linux/lib -L/usr/local/cuda/lib64 -lcudart -lcublas
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_bench.o ds4_bench.c
+/usr/local/cuda/bin/nvcc -O3 -g -lineinfo --use_fast_math  -Xcompiler -march=native -Xcompiler -pthread -o ds4-bench ds4_bench.o ds4_help.o ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o -lm -Xcompiler -pthread -L/usr/local/cuda/targets/sbsa-linux/lib -L/usr/local/cuda/lib64 -lcudart -lcublas
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_eval.o ds4_eval.c
+/usr/local/cuda/bin/nvcc -O3 -g -lineinfo --use_fast_math  -Xcompiler -march=native -Xcompiler -pthread -o ds4-eval ds4_eval.o ds4_help.o ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o -lm -Xcompiler -pthread -L/usr/local/cuda/targets/sbsa-linux/lib -L/usr/local/cuda/lib64 -lcudart -lcublas
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_agent.o ds4_agent.c
+cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -c -o ds4_web.o ds4_web.c
+/usr/local/cuda/bin/nvcc -O3 -g -lineinfo --use_fast_math  -Xcompiler -march=native -Xcompiler -pthread -o ds4-agent ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o -lm -Xcompiler -pthread -L/usr/local/cuda/targets/sbsa-linux/lib -L/usr/local/cuda/lib64 -lcudart -lcublas
+make[1]: Leaving directory '/home/ylow/deepseekflash/ds4'

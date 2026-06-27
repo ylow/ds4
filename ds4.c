@@ -1589,6 +1589,7 @@ static const gguf_type_info gguf_types[] = {
 enum {
     DS4_TENSOR_F32      = 0,
     DS4_TENSOR_F16      = 1,
+    DS4_TENSOR_Q4_1     = 3,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
@@ -3312,7 +3313,10 @@ static void tensor_expect_f16_or_q8_0_layout(
 }
 
 static bool tensor_type_is_q8_0_or_q4_k(uint32_t type) {
-    return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_Q4_K;
+    /* Also accepts Q4_1, the low-ALU 4-bit decode-speed requant for the
+     * attention q/kv projections and output head. */
+    return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q4_1;
 }
 
 static void tensor_expect_q8_0_or_q4_k_layout(
@@ -3324,7 +3328,7 @@ static void tensor_expect_q8_0_or_q4_k_layout(
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_q8_0_or_q4_k(t->type)) {
         fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected q8_0 or q4_K\n",
+                "ds4: tensor %.*s has type %s, expected q8_0, q4_K or q4_1\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
@@ -3683,7 +3687,7 @@ static void weights_validate_layout(
         tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
         tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        tensor_expect_q8_0_or_q4_k_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -3698,10 +3702,10 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+        tensor_expect_q8_0_or_q4_k_layout(l->attn_q_a, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
         tensor_expect_q8_0_or_q4_k_layout(l->attn_q_b, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+        tensor_expect_q8_0_or_q4_k_layout(l->attn_kv, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
         tensor_expect_q8_0_or_q4_k_layout(l->attn_output_a, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
@@ -3768,10 +3772,10 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
     tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
     tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+    tensor_expect_q8_0_or_q4_k_layout(l->attn_q_a, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
     tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
     tensor_expect_q8_0_or_q4_k_layout(l->attn_q_b, 2, DS4_N_LORA_Q, q_dim, 0);
-    tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+    tensor_expect_q8_0_or_q4_k_layout(l->attn_kv, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
     tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
     tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
     tensor_expect_q8_0_or_q4_k_layout(l->attn_output_a, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
@@ -15234,6 +15238,19 @@ static bool metal_graph_profile_router_selection(
     return true;
 }
 
+/* Dispatch a weight matmul by the tensor's quantization type. Q4_1 (low-ALU
+ * 4-bit, decode-bandwidth-bound) and Q4_K both fall back to Q8_0 when the
+ * tensor was not requantized, so this is safe for any of the mixed GGUFs. */
+static int metal_graph_matmul_typed(ds4_gpu_tensor *out, const ds4_model *model,
+                                    const ds4_tensor *w, uint64_t in_dim,
+                                    uint64_t out_dim, ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (w->type == DS4_TENSOR_Q4_1)
+        return ds4_gpu_matmul_q4_1_tensor(out, model->map, model->size, w->abs_offset, in_dim, out_dim, x, n_tok);
+    if (w->type == DS4_TENSOR_Q4_K)
+        return ds4_gpu_matmul_q4k_tensor(out, model->map, model->size, w->abs_offset, in_dim, out_dim, x, n_tok);
+    return ds4_gpu_matmul_q8_0_tensor(out, model->map, model->size, w->abs_offset, in_dim, out_dim, x, n_tok);
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15340,7 +15357,11 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
     bool qkv_pair_projected = false;
-    if (ok && qkv_rms_fused) {
+    /* The Q8 pair kernel only handles Q8_0 weights; if either q_a or kv was
+     * requantized (Q4_1), fall through to the per-tensor typed matmuls below. */
+    const bool qkv_both_q8 = layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+                             layer->attn_kv->type == DS4_TENSOR_Q8_0;
+    if (ok && qkv_rms_fused && qkv_both_q8) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(g->qr,
                                                              g->kv_raw,
                                                              model->map,
@@ -15353,10 +15374,8 @@ static bool metal_graph_encode_decode_layer(
                                                              g->attn_norm,
                                                              1) != 0;
     }
-    if (ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(g->qr,
-                                                                    model->map,
-                                                                    model->size,
-                                                                    layer->attn_q_a->abs_offset,
+    if (ok && !qkv_pair_projected) ok = metal_graph_matmul_typed(g->qr, model,
+                                                                    layer->attn_q_a,
                                                                     DS4_N_EMBD,
                                                                     q_rank,
                                                                     g->attn_norm,
@@ -15365,8 +15384,8 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
     if (qkv_rms_fused) {
-        if (ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
+        if (ok && !qkv_pair_projected) ok = metal_graph_matmul_typed(g->kv_raw, model,
+                                                  layer->attn_kv,
                                                   DS4_N_EMBD, DS4_N_HEAD_DIM,
                                                   g->attn_norm, 1) != 0;
         if (ok) {
@@ -15397,14 +15416,8 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
     if (ok) {
-        if (layer->attn_q_b->type == DS4_TENSOR_Q4_K)
-            ok = ds4_gpu_matmul_q4k_tensor(g->q, model->map, model->size,
-                                           layer->attn_q_b->abs_offset, q_rank, q_dim,
-                                           g->qr_norm, 1) != 0;
-        else
-            ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
-                                            layer->attn_q_b->abs_offset, q_rank, q_dim,
-                                            g->qr_norm, 1) != 0;
+        ok = metal_graph_matmul_typed(g->q, model, layer->attn_q_b, q_rank, q_dim,
+                                      g->qr_norm, 1) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
@@ -15445,8 +15458,8 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
     }
     if (!qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
+        if (ok) ok = metal_graph_matmul_typed(g->kv_raw, model,
+                                                  layer->attn_kv,
                                                   DS4_N_EMBD, DS4_N_HEAD_DIM,
                                                   g->attn_norm, 1) != 0;
         if (ok) {
@@ -16038,15 +16051,19 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
+    /* Shared expert requantized to Q4_1 uses the per-tensor typed matmuls (no
+     * Q4_1 fused gate-up-swiglu / down-hc kernels), so disable both fusions. */
+    const bool shared_q4_1 = layer->ffn_gate_shexp->type == DS4_TENSOR_Q4_1 ||
+                             layer->ffn_down_shexp->type == DS4_TENSOR_Q4_1;
 #ifdef DS4_ROCM_BUILD
-    const bool fuse_shared_gate_up = !g->quality;
+    const bool fuse_shared_gate_up = !g->quality && !shared_q4_1;
 #else
     const bool fuse_shared_gate_up =
-        !g->quality &&
+        !g->quality && !shared_q4_1 &&
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
 #endif
     const bool fuse_shared_down_hc =
-        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+        !keep_ffn_out && !shared_q4_1 && !metal_graph_use_reference_shared_down_hc();
     const bool q4_selected_shared_overlap =
         metal_graph_use_q4_selected_shared_overlap() &&
         metal_graph_decode_q4_selected_slots_expected(g,
@@ -16559,10 +16576,9 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
-                                              model->map,
-                                              model->size,
-                                              weights->output->abs_offset,
+    if (ok) ok = metal_graph_matmul_typed(g->logits,
+                                              model,
+                                              weights->output,
                                               DS4_N_EMBD,
                                               vocab_dim,
                                               g->output_norm,
@@ -16648,10 +16664,9 @@ static bool metal_graph_encode_output_head_batch(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits,
-                                              model->map,
-                                              model->size,
-                                              weights->output->abs_offset,
+    if (ok) ok = metal_graph_matmul_typed(logits,
+                                              model,
+                                              weights->output,
                                               DS4_N_EMBD,
                                               vocab_dim,
                                               output_norm,
@@ -16701,6 +16716,10 @@ static bool metal_graph_matmul_q8_0_named_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     (void)module; (void)il; (void)pos0;
+    if (w->type == DS4_TENSOR_Q4_1) {
+        return ds4_gpu_matmul_q4_1_tensor(out, model->map, model->size,
+                                          w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
+    }
     if (w->type == DS4_TENSOR_Q4_K) {
         return ds4_gpu_matmul_q4k_tensor(out, model->map, model->size,
                                          w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
@@ -17957,7 +17976,8 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_wants("Qraw", il, pos0) ||
         metal_graph_debug_wants("Qnorm", il, pos0);
     bool q_b_f16_out = false;
-    if (ok && !q_path_debug && layer->attn_q_b->type != DS4_TENSOR_Q4_K) {
+    if (ok && !q_path_debug && layer->attn_q_b->type != DS4_TENSOR_Q4_K &&
+        layer->attn_q_b->type != DS4_TENSOR_Q4_1) {
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(g->batch_q,
                                                                      g->batch_q_half,
                                                                      model->map,

@@ -1098,6 +1098,18 @@ int ds4_gpu_matmul_q4k_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Q4_1 (low-ALU 4-bit) matmul: warp8 dp4a GEMV for decode (n_tok==1), dequant
+ * to F16 + cuBLAS for prefill. Bandwidth-bound, ~2x faster than Q8 on the GB10. */
+int ds4_gpu_matmul_q4_1_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 /* Q4_K batch attention output: output_a (grouped projection) then output_b (plain matmul). */
 int ds4_gpu_attention_output_q4k_batch_tensor(
         ds4_gpu_tensor       *out,

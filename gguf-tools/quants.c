@@ -40,7 +40,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_F32]     = { "f32",      1,   4, false, false },
     [DS4Q_TYPE_F16]     = { "f16",      1,   2, false, false },
     [DS4Q_TYPE_Q4_0]    = { "q4_0",    32,  18, false, false },
-    [DS4Q_TYPE_Q4_1]    = { "q4_1",    32,  20, false, false },
+    [DS4Q_TYPE_Q4_1]    = { "q4_1",    32,  20, true,  false },
     [DS4Q_TYPE_Q5_0]    = { "q5_0",    32,  22, false, false },
     [DS4Q_TYPE_Q5_1]    = { "q5_1",    32,  24, false, false },
     [DS4Q_TYPE_Q8_0]    = { "q8_0",    32,  34, true,  false },
@@ -362,6 +362,46 @@ static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
         int8_t *qs = (int8_t *)(out + sizeof(hd));
         for (int j = 0; j < qk; j++) qs[j] = (int8_t)roundf(x[j] * id);
         out += sizeof(hd) + qk;
+    }
+    return (size_t)nrows * row_size;
+}
+
+/* Q4_1: 32-weight blocks, {f16 d; f16 min; 4-bit qs[32] packed into 16 bytes}.
+ * Asymmetric (min offset) so quality beats Q4_0; low-ALU dequant (one scale +
+ * one min per block, no super-block) so the decode GEMV stays bandwidth-bound on
+ * the GB10 (unlike Q4_K). Nibble layout matches ggml: qs[j] low = w[j], high = w[j+16]. */
+static size_t ds4q_quantize_q4_1(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols) {
+    const int64_t qk = 32;
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q4_1, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t nblocks = nrows * (ncols / qk);
+
+    for (int64_t b = 0; b < nblocks; b++) {
+        const float *x = src + start + (size_t)b * qk;
+        float min = x[0], max = x[0];
+        for (int j = 1; j < qk; j++) {
+            if (x[j] < min) min = x[j];
+            if (x[j] > max) max = x[j];
+        }
+        const float d = (max - min) / 15.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t hd = ds4q_f32_to_f16(d);
+        const uint16_t hm = ds4q_f32_to_f16(min);
+        memcpy(out, &hd, sizeof(hd));
+        memcpy(out + sizeof(hd), &hm, sizeof(hm));
+
+        uint8_t *qs = out + 2 * sizeof(uint16_t);
+        uint8_t L[32];
+        for (int j = 0; j < qk; j++) {
+            int q = (int)roundf((x[j] - min) * id);
+            if (q < 0) q = 0;
+            if (q > 15) q = 15;
+            L[j] = (uint8_t)q;
+        }
+        for (int j = 0; j < 16; j++) qs[j] = (uint8_t)(L[j] | (L[j + 16] << 4));
+        out += 2 * sizeof(uint16_t) + qk / 2;
     }
     return (size_t)nrows * row_size;
 }
@@ -1074,6 +1114,10 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_Q2_K) {
         return ds4q_quantize_q2_k(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_Q4_1) {
+        (void)imatrix;
+        return ds4q_quantize_q4_1(src, dst, start, nrows, ncols);
     }
     if (type == DS4Q_TYPE_Q4_K) {
         return ds4q_quantize_q4_k(src, dst, start, nrows, ncols, imatrix);

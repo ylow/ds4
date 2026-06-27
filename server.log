@@ -1,0 +1,79 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121)
+ds4: CUDA host registration skipped: operation not supported
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA loading model tensors 16.02 GiB cached
+ds4: CUDA prepared model tensor mappings 16.37 GiB
+ds4: CUDA loading model tensors 32.06 GiB cached
+ds4: CUDA prepared model tensor mappings 32.07 GiB
+ds4: CUDA loading model tensors 48.02 GiB cached
+ds4: CUDA prepared model tensor mappings 48.43 GiB
+ds4: CUDA loading model tensors 64.06 GiB cached
+ds4: CUDA prepared model tensor mappings 64.13 GiB
+ds4: CUDA loading model tensors 80.04 GiB cached
+ds4: CUDA prepared model tensor mappings 80.24 GiB
+ds4: CUDA startup model preparation covered 80.76 GiB of tensor spans in 39.807s
+ds4: cuda backend initialized for graph diagnostics
+0624 20:01:44 ds4-server: context buffers 3111.75 MiB (ctx=131072, backend=cuda, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=32770)
+0624 20:01:47 ds4-server: KV disk cache /tmp/ds4-kv (budget=4096 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0624 20:01:47 ds4-server: listening on http://127.0.0.1:8000
+0624 20:02:04 ds4-server: chat ctx=0..23:23 prompt start
+0624 20:02:04 ds4-server: chat ctx=0..23:23 prompt done 0.754s
+0624 20:02:08 ds4-server: chat ctx=23..73:50 gen=50 THINKING decoding chunk=14.84 t/s avg=14.84 t/s 3.369s
+0624 20:02:11 ds4-server: chat ctx=73..123:50 gen=100 THINKING decoding chunk=14.64 t/s avg=14.74 t/s 6.783s
+0624 20:02:13 ds4-server: chat ctx=123..143:20 gen=120 THINKING decoding chunk=14.67 t/s avg=14.73 t/s 8.146s
+ds4-server: thinking not closed, ignoring DSML in reasoning
+0624 20:02:13 ds4-server: chat ctx=0..23:23 gen=120 THINKING finish=length 8.900s
+0624 20:02:28 ds4-server: live kv cache miss live=143 prompt=19 common=1 reason=token-mismatch
+0624 20:02:28 ds4-server: chat ctx=0..19:19 prompt start
+0624 20:02:28 ds4-server: chat ctx=0..19:19 prompt done 0.279s
+0624 20:02:31 ds4-server: chat ctx=19..69:50 gen=50 THINKING decoding chunk=14.96 t/s avg=14.96 t/s 3.342s
+0624 20:02:33 ds4-server: chat ctx=69..99:30 gen=80 THINKING decoding chunk=14.93 t/s avg=14.95 t/s 5.352s
+ds4-server: thinking not closed, ignoring DSML in reasoning
+0624 20:02:33 ds4-server: chat ctx=0..19:19 gen=80 THINKING finish=length 5.631s
+0624 20:03:06 ds4-server: live kv cache miss live=99 prompt=12 common=1 reason=token-mismatch
+0624 20:03:06 ds4-server: chat ctx=0..12:12 prompt start
+0624 20:03:06 ds4-server: chat ctx=0..12:12 prompt done 0.207s
+0624 20:03:07 ds4-server: chat ctx=12..24:12 gen=12 THINKING decoding chunk=14.97 t/s avg=14.97 t/s 0.802s
+ds4-server: thinking not closed, ignoring DSML in reasoning
+0624 20:03:07 ds4-server: chat ctx=0..12:12 final stream failed
+0624 20:03:07 ds4-server: chat ctx=0..12:12 gen=12 THINKING finish=error error="client stream write failed" 1.009s
+0624 20:03:19 ds4-server: live kv cache miss live=24 prompt=350 common=1 reason=token-mismatch
+0624 20:03:19 ds4-server: chat ctx=0..350:350 TOOLS prompt start
+0624 20:03:20 ds4-server: chat ctx=0..350:350 TOOLS prompt done 1.020s
+0624 20:03:24 ds4-server: chat ctx=350..400:50 gen=50 TOOLS DSML_START decoding chunk=14.59 t/s avg=14.59 t/s 3.426s
+0624 20:03:25 ds4-server: chat ctx=400..420:20 gen=70 TOOLS DSML_START DSML_END decoding chunk=14.79 t/s avg=14.65 t/s 4.779s
+0624 20:03:25 ds4-server: tool calls ctx=0..350:350 n=1 raw_dsml=1 ids=[toolu_4f55977294a449a7e99ba17ba9aac6f6] names=[get_weather]
+0624 20:03:25 ds4-server: chat ctx=0..350:350 gen=70 TOOLS DSML_START DSML_END finish=tool_calls 5.799s
+0624 20:04:08 ds4-server: live kv cache miss live=420 prompt=5 common=1 reason=token-mismatch
+0624 20:04:08 ds4-server: chat ctx=0..5:5 prompt start
+0624 20:04:08 ds4-server: chat ctx=0..5:5 prompt done 0.144s
+0624 20:04:08 ds4-server: chat ctx=5..15:10 gen=10 THINKING decoding chunk=14.88 t/s avg=14.88 t/s 0.672s
+ds4-server: thinking not closed, ignoring DSML in reasoning
+0624 20:04:08 ds4-server: chat ctx=0..5:5 gen=10 THINKING finish=length 0.816s
+0624 20:04:45 ds4-server: live kv cache miss live=15 prompt=19849 common=1 reason=token-mismatch
+0624 20:04:45 ds4-server: chat ctx=0..19849:19849 TOOLS prompt start
+0624 20:04:45 ds4-server: chat ctx=0..19849:19849 TOOLS prefill chunk 0/19849 (0.0%) chunk=0.00 t/s avg=0.00 t/s 0.000s
+0624 20:04:56 ds4-server: chat ctx=0..19849:19849 TOOLS prefill chunk 4096/19849 (20.6%) chunk=385.62 t/s avg=385.60 t/s 10.622s
+0624 20:05:06 ds4-server: chat ctx=0..19849:19849 TOOLS prefill chunk 8192/19849 (41.3%) chunk=401.19 t/s avg=393.24 t/s 20.832s
+0624 20:05:18 ds4-server: chat ctx=0..19849:19849 TOOLS prefill chunk 12288/19849 (61.9%) chunk=337.69 t/s avg=372.80 t/s 32.961s
+0624 20:05:29 ds4-server: chat ctx=0..19849:19849 TOOLS prefill chunk 16384/19849 (82.5%) chunk=383.93 t/s avg=375.52 t/s 43.630s
+0624 20:05:39 ds4-server: chat ctx=0..19849:19849 TOOLS prefill chunk 19763/19849 (99.6%) chunk=321.67 t/s avg=365.07 t/s 54.135s
+0624 20:05:40 ds4-server: kv cache stored tokens=19763 trimmed=86 reason=cold key=token-text size=282.33 MiB save=123.7 ms
+0624 20:05:41 ds4-server: chat ctx=0..19849:19849 TOOLS prefill chunk 19849/19849 (100.0%) chunk=49.99 t/s avg=355.37 t/s 55.855s
+0624 20:05:41 ds4-server: chat ctx=0..19849:19849 TOOLS prompt done 55.855s
+0624 20:05:43 ds4-server: chat ctx=19849..19880:31 gen=31 TOOLS decoding chunk=12.88 t/s avg=12.88 t/s 2.406s
+0624 20:05:43 ds4-server: chat ctx=0..19849:19849 gen=31 TOOLS finish=stop 58.261s
+0624 20:06:09 ds4-server: live kv cache miss live=19880 prompt=19847 common=19843 reason=token-mismatch
+0624 20:06:10 ds4-server: kv cache stored tokens=19880 trimmed=0 reason=evict key=token-text size=283.90 MiB save=162.3 ms
+0624 20:06:11 ds4-server: kv cache hit text tokens=19763 text=82576 quant=2 key=token-text load=397.5 ms file=/tmp/ds4-kv/d79dcf2193062938d60639cf4c758a8b7894a26c.kv
+0624 20:06:11 ds4-server: chat ctx=19763..19847:84 TOOLS prompt start
+0624 20:06:11 ds4-server: chat ctx=19763..19847:84 TOOLS prefill chunk 0/84 (0.0%) chunk=0.00 t/s avg=0.00 t/s 0.000s
+0624 20:06:11 ds4-server: chat ctx=19763..19847:84 TOOLS prefill chunk 84/84 (100.0%) chunk=102.71 t/s avg=102.70 t/s 0.818s
+0624 20:06:11 ds4-server: chat ctx=19763..19847:84 TOOLS prompt done 0.818s
+0624 20:06:13 ds4-server: chat ctx=19847..19869:22 gen=22 TOOLS decoding chunk=12.99 t/s avg=12.99 t/s 1.693s
+0624 20:06:13 ds4-server: chat ctx=19763..19847:84 gen=22 TOOLS finish=stop 2.511s
+0624 22:32:32 ds4-server: shutdown requested, draining requests
+0624 22:32:32 ds4-server: persisting current KV cache before shutdown tokens=19869
+0624 22:32:33 ds4-server: kv cache stored tokens=19869 trimmed=0 reason=shutdown key=token-text size=283.75 MiB save=146.3 ms

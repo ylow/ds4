@@ -70,6 +70,16 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+/* Q4_1: 32-weight blocks {f16 d; f16 min; 4-bit qs[32] packed into 16 bytes} =
+ * 20 bytes. Low-ALU asymmetric 4-bit: weight = nibble*d + min. The 20-byte block
+ * is 4-byte aligned (unlike Q8_0's 34B), so the GEMV uses plain aligned int32
+ * loads and stays bandwidth-bound. qs[j] low nibble = w[j], high = w[j+16]. */
+typedef struct {
+    uint16_t d;
+    uint16_t m;
+    uint8_t qs[16];
+} cuda_block_q4_1;
+
 #include "ds4_iq2_tables_cuda.inc"
 
 static const void *g_model_host_base;
@@ -8383,6 +8393,148 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
 }
+/* Q4_1 decode GEMV: one warp per output row, Q8_0-quantized activation (xq +
+ * per-32 xscale, identical to the Q8 path). dot = xscale*(d*sum(nibble*q8) +
+ * m*sum(q8)). 20-byte blocks are 4-aligned so all loads are plain int32. */
+/* Per-32-block activation sums (sum of the int8 q values), computed once and
+ * reused by every output row -- the Q4_1 min term needs sum(q8) per block. */
+__global__ static void q8_block_sums_kernel(int *xsum, const int8_t *xq, uint32_t blocks) {
+    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= blocks) return;
+    const int8_t *a = xq + (uint64_t)b * 32u;
+    int s = 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < 32u; i += 4u) s = __dp4a(0x01010101, *(const int32_t *)(a + i), s);
+    xsum[b] = s;
+}
+
+__global__ static void matmul_q4_1_preq_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        const int *xsum,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 20u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const unsigned char *blk = wr + b * 20u;
+        const float d = __half2float(*(const __half *)blk);
+        const float m = __half2float(*(const __half *)(blk + 2));
+        const int32_t *q = (const int32_t *)(blk + 4);
+        const int8_t *a = xq + b * 32u;
+        int s = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const int32_t wv = q[i];
+            s = __dp4a(wv & 0x0f0f0f0f, *(const int32_t *)(a + i * 4u), s);
+            s = __dp4a((wv >> 4) & 0x0f0f0f0f, *(const int32_t *)(a + 16u + i * 4u), s);
+        }
+        acc += xscale[b] * (d * (float)s + m * (float)xsum[b]);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+/* Batch (prefill) Q4_1 GEMV: same dp4a math as the decode kernel, indexed by
+ * token in grid.y. Avoids any per-call weight dequant / cudaMalloc. */
+__global__ static void matmul_q4_1_preq_batch_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        const int *xsum,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim || tok >= n_tok) return;
+    const unsigned char *wr = w + row * blocks * 20u;
+    const int8_t *xqt = xq + tok * blocks * 32u;
+    const float *xscalet = xscale + tok * blocks;
+    const int *xsumt = xsum + tok * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const unsigned char *blk = wr + b * 20u;
+        const float d = __half2float(*(const __half *)blk);
+        const float m = __half2float(*(const __half *)(blk + 2));
+        const int32_t *q = (const int32_t *)(blk + 4);
+        const int8_t *a = xqt + b * 32u;
+        int s = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const int32_t wv = q[i];
+            s = __dp4a(wv & 0x0f0f0f0f, *(const int32_t *)(a + i * 4u), s);
+            s = __dp4a((wv >> 4) & 0x0f0f0f0f, *(const int32_t *)(a + 16u + i * 4u), s);
+        }
+        acc += xscalet[b] * (d * (float)s + m * (float)xsumt[b]);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[tok * out_dim + row] = acc;
+}
+
+extern "C" int ds4_gpu_matmul_q4_1_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map || in_dim == 0u || (in_dim % 32u) != 0u) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 20u)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 20u;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q4_1");
+    if (!wptr) return 0;
+
+    if (n_tok == 1) {
+        const uint64_t xq_bytes = blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t sum_offset = (scale_offset + blocks * sizeof(float) + 15u) & ~15ull;
+        const uint64_t tmp_bytes = sum_offset + blocks * sizeof(int);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q4_1 prequant");
+        if (!tmp) return 0;
+        int8_t *xq = (int8_t *)tmp;
+        float *xscale = (float *)((char *)tmp + scale_offset);
+        int *xsum = (int *)((char *)tmp + sum_offset);
+        quantize_q8_0_f32_kernel<<<dim3((unsigned)blocks, 1u, 1u), 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        if (!cuda_ok(cudaGetLastError(), "matmul_q4_1 quantize launch")) return 0;
+        q8_block_sums_kernel<<<((unsigned)blocks + 255u) / 256u, 256>>>(xsum, xq, (uint32_t)blocks);
+        if (!cuda_ok(cudaGetLastError(), "matmul_q4_1 block sums launch")) return 0;
+        matmul_q4_1_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+                xq, xscale, xsum, in_dim, out_dim, blocks);
+        return cuda_ok(cudaGetLastError(), "matmul_q4_1 warp launch");
+    }
+
+    /* prefill: quantize all tokens' activations to Q8_0 + per-block sums, then
+     * the batch dp4a kernel (same arithmetic as decode, no weight dequant). */
+    const uint64_t xq_bytes = n_tok * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t scale_bytes = n_tok * blocks * sizeof(float);
+    const uint64_t sum_offset = (scale_offset + scale_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = sum_offset + n_tok * blocks * sizeof(int);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q4_1 batch prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    int *xsum = (int *)((char *)tmp + sum_offset);
+    quantize_q8_0_f32_kernel<<<dim3((unsigned)blocks, (unsigned)n_tok, 1u), 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "q4_1 batch quantize launch")) return 0;
+    q8_block_sums_kernel<<<((unsigned)(n_tok * blocks) + 255u) / 256u, 256>>>(xsum, xq, (uint32_t)(n_tok * blocks));
+    if (!cuda_ok(cudaGetLastError(), "q4_1 batch block sums launch")) return 0;
+    dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1u);
+    matmul_q4_1_preq_batch_warp8_kernel<<<bgrid, 256>>>(
+            (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+            xq, xscale, xsum, in_dim, out_dim, n_tok, blocks);
+    return cuda_ok(cudaGetLastError(), "matmul_q4_1 batch launch");
+}
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
