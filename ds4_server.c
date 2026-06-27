@@ -9113,6 +9113,84 @@ static void trace_write_token(FILE *fp, ds4_engine *engine, int token) {
     free(piece);
 }
 
+/* Append bytes to a fixed buffer, escaping control characters the same way the
+ * trace writer does (\n, \r, \t, and \xNN for other non-printables), so a
+ * single log line can safely show the raw text around a cache-miss divergence.
+ * Always leaves out[] NUL-terminated; stops without overflowing when full.
+ * Returns the new length. Pure (no engine), so it is unit-testable. */
+static size_t escape_text_into(char *out, size_t cap, size_t at,
+                               const char *p, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    if (!out || cap == 0) return at;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)p[i];
+        char tmp[4];
+        size_t n;
+        if (c == '\n') { tmp[0] = '\\'; tmp[1] = 'n'; n = 2; }
+        else if (c == '\r') { tmp[0] = '\\'; tmp[1] = 'r'; n = 2; }
+        else if (c == '\t') { tmp[0] = '\\'; tmp[1] = 't'; n = 2; }
+        else if (c == '"') { tmp[0] = '\\'; tmp[1] = '"'; n = 2; }
+        else if (c == '\\') { tmp[0] = '\\'; tmp[1] = '\\'; n = 2; }
+        else if (c < 0x20 || c == 0x7f) {
+            tmp[0] = '\\'; tmp[1] = 'x'; tmp[2] = hex[c >> 4]; tmp[3] = hex[c & 15];
+            n = 4;
+        } else { tmp[0] = (char)c; n = 1; }
+        if (at + n + 1 > cap) break;   /* keep room for the NUL */
+        memcpy(out + at, tmp, n);
+        at += n;
+    }
+    out[at < cap ? at : cap - 1] = '\0';
+    return at;
+}
+
+/* Decode tokens ids[from..to) into out[], escaped, capped to cap bytes. */
+static size_t decode_tokens_escaped(ds4_engine *engine, const int *ids, int count,
+                                    int from, int to, char *out, size_t cap,
+                                    size_t at) {
+    if (from < 0) from = 0;
+    if (to > count) to = count;
+    for (int i = from; i < to; i++) {
+        int id = ids[i];
+        if (id < 0) continue;
+        size_t len = 0;
+        char *piece = ds4_token_text(engine, id, &len);
+        if (!piece) continue;
+        at = escape_text_into(out, cap, at, piece, len);
+        free(piece);
+        if (at + 1 >= cap) break;
+    }
+    return at;
+}
+
+/* Build a compact, human-readable summary of where the incoming prompt first
+ * diverged from the live KV checkpoint, decoded to escaped text.  This makes a
+ * cache miss self-explanatory in the normal server log (e.g. an early
+ * hook/reminder string poisoning the prefix) without enabling --trace.  Writes
+ * a NUL-terminated string (empty if there is no shared-region mismatch). */
+#define CACHE_MISS_CTX_TOKENS 6
+static void cache_miss_divergence_summary(ds4_engine *engine,
+                                          const trace_cache_diag *d,
+                                          char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!out || cap == 0 || !engine || !d || !d->valid) return;
+    /* Only a token mismatch inside the shared region has a meaningful "first
+     * differing token"; a shorter prompt or absent checkpoint does not. */
+    if (d->old_pos == 0 || d->common >= d->old_pos) return;
+    const int ci = d->common - d->start;            /* divergence index in window */
+    if (ci < 0 || ci > d->count) return;
+
+    char ctxs[80] = {0}, lives[80] = {0}, news[80] = {0};
+    /* Shared context before the divergence (live == prompt here). */
+    decode_tokens_escaped(engine, d->live_id, d->count,
+                          ci - CACHE_MISS_CTX_TOKENS, ci, ctxs, sizeof ctxs, 0);
+    decode_tokens_escaped(engine, d->live_id, d->count,
+                          ci, ci + CACHE_MISS_CTX_TOKENS, lives, sizeof lives, 0);
+    decode_tokens_escaped(engine, d->prompt_id, d->count,
+                          ci, ci + CACHE_MISS_CTX_TOKENS, news, sizeof news, 0);
+    snprintf(out, cap, " at#%d ctx=\"%s\" live=\"%s\" new=\"%s\"",
+             d->common, ctxs, lives, news);
+}
+
 static void trace_write_cache_diag(
         server *s,
         const trace_cache_diag *d,
@@ -10087,11 +10165,21 @@ static void generate_job(server *s, job *j) {
         }
     }
     if (cached == 0 && old_pos > 0) {
+        /* Divergence in the first half of the shared prefix means a small
+         * dynamic span (hook output, per-turn reminder, moved system block)
+         * sits in front of a large static region and just invalidated all of
+         * it.  Flag that case and decode the first differing tokens so the
+         * culprit is visible in the normal log without --trace. */
+        const bool early = (long)common * 2 < (long)old_pos;
+        char diverge[256];
+        cache_miss_divergence_summary(s->engine, &cache_diag, diverge, sizeof diverge);
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
+                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s%s%s",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
-                   trace_cache_miss_reason(&cache_diag));
+                   trace_cache_miss_reason(&cache_diag),
+                   early ? " early-divergence" : "",
+                   diverge);
     }
     if (cached == 0) s->kv.continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -15757,7 +15845,32 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_cache_miss_divergence_escapes_control_bytes(void) {
+    char out[64];
+    /* The xterm title escape that poisoned a real prefix must render visibly so
+     * the cache-miss log names the culprit instead of dropping raw control
+     * bytes. */
+    const char in[] = "branch\x1b]0;x\x07\n";
+    size_t n = escape_text_into(out, sizeof out, 0, in, sizeof in - 1);
+    TEST_ASSERT(n == strlen(out));
+    TEST_ASSERT(!strcmp(out, "branch\\x1b]0;x\\x07\\n"));
+
+    /* Quotes and backslashes are escaped so the log's own quoting stays
+     * parseable. */
+    char out2[32];
+    escape_text_into(out2, sizeof out2, 0, "a\"b\\c", 5);
+    TEST_ASSERT(!strcmp(out2, "a\\\"b\\\\c"));
+
+    /* Never overflows: a cap that cannot hold the next escape truncates cleanly
+     * and stays NUL-terminated. */
+    char small[5];
+    escape_text_into(small, sizeof small, 0, "\n\n\n\n", 4);
+    TEST_ASSERT(!strcmp(small, "\\n\\n"));
+    TEST_ASSERT(small[strlen(small)] == '\0');
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_cache_miss_divergence_escapes_control_bytes();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();

@@ -18,6 +18,7 @@ exec ./ds4-server \
   --ctx 800000 \
   --kv-disk-space-mb 40960 \
   --kv-disk-dir /tmp/ds4-kv \
+  --kv-cache-cold-max-tokens 50000 \
   --host 0.0.0.0 \
   --port 8000 \
   "$@"
