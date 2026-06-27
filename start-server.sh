@@ -15,8 +15,9 @@ MODEL="${DS4_MODEL:-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AQkvQ41-AOutQ4K-SExpQ8-O
 exec ./ds4-server \
   --cuda \
   -m "$MODEL" \
-  --ctx 131072 \
+  --ctx 800000 \
+  --kv-disk-space-mb 40960 \
   --kv-disk-dir /tmp/ds4-kv \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 8000 \
   "$@"
